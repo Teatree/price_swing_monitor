@@ -520,9 +520,9 @@ def api_log():
         return jsonify({"entries": list(market_log), "total": len(market_log), "source": "memory"})
 
 
-TELEGRAM_BOT_TOKEN = "8644473126:AAE4cDaIM25LCg9eXIcZE1kxXABmXzGUA5k"
-TELEGRAM_CHAT_ID = "761610515"
-SITE_URL = "https://price-swing-monitor.onrender.com/"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SITE_URL = os.environ.get("SITE_URL", "https://price-swing-monitor.onrender.com/")
 
 
 def _format_telegram_message(markets: list[dict]) -> str:
