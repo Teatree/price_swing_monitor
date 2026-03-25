@@ -467,6 +467,14 @@ function renderResults(data) {
   area.innerHTML = html;
 }
 
+function liveDuration(mins) {
+  if (mins == null || mins < 0) return '?';
+  if (mins < 60) return mins + 'm';
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h + 'h' + (m > 0 ? ' ' + m + 'm' : '');
+}
+
 function renderCard(r, isDimmed) {
   const dimCls = isDimmed ? ' card-dimmed' : '';
 
@@ -494,6 +502,7 @@ function renderCard(r, isDimmed) {
          title="${esc(r.market_question)}">${esc(r.market_question || r.event_title)}</a>
     </div>
     <div class="card-meta">
+      ${r.live_minutes != null ? '<span>Live ' + liveDuration(r.live_minutes) + '</span>' : ''}
       <span>Vol $${fmtNum(r.volume)}</span>
     </div>`;
 

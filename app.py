@@ -33,7 +33,7 @@ with app.app_context():
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
-DELAY = 0.2
+DELAY = 0.15
 
 # Live detection parameters
 STABLE_BAND_CENTS = 2      # max ±2c variation to count as "stable"
@@ -147,9 +147,9 @@ def clob_book_depth(token_id: str, levels: int = 5) -> float:
         return 0.0
 
 
-def clob_price_history(token_id: str, now_unix: int) -> list[float]:
+def clob_price_history(token_id: str, now_unix: int) -> list[dict]:
     """Fetch last 8 hours of price data at 5-minute intervals.
-    Returns list of prices (floats), newest last."""
+    Returns list of {t: unix_timestamp, p: price} dicts, newest last."""
     try:
         r = requests.get(f"{CLOB}/prices-history", params={
             "market": token_id,
@@ -160,56 +160,61 @@ def clob_price_history(token_id: str, now_unix: int) -> list[float]:
         if r.status_code != 200:
             return []
         history = r.json().get("history", [])
-        return [float(pt.get("p", 0)) for pt in history]
+        return [{"t": int(pt.get("t", 0)), "p": float(pt.get("p", 0))} for pt in history]
     except Exception as e:
         logger.debug("prices-history error %s: %s", token_id, e)
         return []
 
 
-def find_stable_price(prices: list[float]) -> float | None:
+def find_stable_price_and_breakout(history: list[dict]) -> tuple[float | None, int | None]:
     """Walk backwards through price history to find the last stable plateau.
 
     A plateau is STABLE_MIN_POINTS (6) consecutive prices where
-    max - min <= STABLE_BAND_CENTS/100. Returns the median of that plateau,
-    or None if no stable region is found.
-    """
-    if len(prices) < STABLE_MIN_POINTS:
-        return None
+    max - min <= STABLE_BAND_CENTS/100.
 
+    Returns (stable_price, breakout_timestamp):
+    - stable_price: median of the plateau (pre-match line)
+    - breakout_timestamp: unix timestamp of the first point AFTER the plateau
+      (i.e., when the match started / prices began moving)
+    """
+    if len(history) < STABLE_MIN_POINTS:
+        return None, None
+
+    prices = [pt["p"] for pt in history]
     band = STABLE_BAND_CENTS / 100
 
-    # Walk backwards from the end of the history
-    # We want the LAST stable region before the current volatility
-    # Start from the end and try to find where volatility begins,
-    # then look for stability before that.
     for end in range(len(prices) - 1, STABLE_MIN_POINTS - 2, -1):
-        # Check if [end - STABLE_MIN_POINTS + 1 .. end] is stable
         start = end - STABLE_MIN_POINTS + 1
         window = prices[start:end + 1]
         if max(window) - min(window) <= band:
-            # Found a stable region — now extend it backwards as far as possible
+            # Extend plateau backwards
             while start > 0 and max(prices[start - 1:end + 1]) - min(prices[start - 1:end + 1]) <= band:
                 start -= 1
             plateau = prices[start:end + 1]
-            return round(median(plateau), 4)
+            stable_price = round(median(plateau), 4)
+            # Breakout = first point after the plateau
+            breakout_idx = end + 1
+            breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
+            return stable_price, breakout_ts
 
-    return None
+    return None, None
 
 
-def detect_live(prices: list[float], current_price: float):
+def detect_live(history: list[dict], current_price: float):
     """Determine if a market is live using the breakout-from-stability method.
 
-    Returns (is_live: bool, stable_price: float|None).
+    Returns (is_live, stable_price, breakout_ts).
     - stable_price is the pre-match line (median of last stable plateau)
+    - breakout_ts is the unix timestamp when prices started moving
     - is_live is True if current price has broken out >=5c from stable
     """
-    stable = find_stable_price(prices)
+    stable, breakout_ts = find_stable_price_and_breakout(history)
     if stable is None:
-        return False, None
+        return False, None, None
 
     movement = abs(current_price - stable)
     is_live = movement >= (BREAKOUT_CENTS / 100)
-    return is_live, stable
+    return is_live, stable, breakout_ts
 
 # ---------------------------------------------------------------------------
 # Moneyline detection
@@ -302,42 +307,54 @@ def _process_market(market, event, sport, now, now_unix,
     if not _is_moneyline(question, outcomes):
         return None
 
-    # --- Fetch current best-ask prices from CLOB ---
+    # --- Quick pre-filter using Gamma prices (FREE, no API call) ---
+    gamma_prices = _parse(market.get("outcomePrices"))
+    if gamma_prices and len(gamma_prices) == len(outcomes):
+        gp = [float(p) for p in gamma_prices]
+        # If any outcome >= 99c, match is decided → skip
+        if any(p >= 0.99 for p in gp):
+            return None
 
+    # --- Fetch price history for live detection (1 CLOB call) ---
+    history = clob_price_history(tokens[0], now_unix)
+    time.sleep(DELAY)
+
+    if not history:
+        return None
+
+    # Use the latest point from history as current price for token 0
+    cur0 = float(history[-1]["p"])
+
+    is_live, stable_price, breakout_ts = detect_live(history, cur0)
+    if not is_live:
+        return None
+
+    # --- Now fetch real best-ask prices from CLOB (only for live markets) ---
     current: list[float | None] = []
     for tok in tokens:
         current.append(clob_price(tok))
         time.sleep(DELAY)
 
-    # Skip if any outcome >= 99c (match effectively decided)
+    # Re-check with real prices: skip if any outcome >= 99c
     if any(c is not None and c >= 0.99 for c in current):
         return None
 
-    # --- Live detection via price history on first token ---
-    cur0 = current[0] if current else None
-    if cur0 is None:
-        return None
-
-    history = clob_price_history(tokens[0], now_unix)
-    time.sleep(DELAY)
-
-    is_live, stable_price = detect_live(history, cur0)
-    if not is_live:
-        return None
+    # --- Duration since breakout (how long the match has been live) ---
+    live_minutes = None
+    if breakout_ts:
+        live_minutes = int((now_unix - breakout_ts) / 60)
 
     # --- Build pre-match prices from stable price ---
-    # stable_price is for token[0]. For 2-outcome markets, token[1] = 1 - token[0]
     pre_match: list[float | None] = []
     if stable_price is not None:
         pre_match.append(stable_price)
         if len(tokens) == 2:
             pre_match.append(round(1 - stable_price, 4))
         else:
-            # For 3+ outcomes, fetch history for each additional token
             for tok in tokens[1:]:
                 h = clob_price_history(tok, now_unix)
                 time.sleep(DELAY)
-                s = find_stable_price(h)
+                s, _ = find_stable_price_and_breakout(h)
                 pre_match.append(s)
     else:
         pre_match = [None] * len(tokens)
@@ -401,6 +418,7 @@ def _process_market(market, event, sport, now, now_unix,
         "condition_id": market.get("conditionId", ""),
         "sport": sport,
         "game_start": market.get("gameStartTime"),
+        "live_minutes": live_minutes,
         "polymarket_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "volume": vol,
         "outcomes": outcome_data,
