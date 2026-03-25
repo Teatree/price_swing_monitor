@@ -520,6 +520,128 @@ def api_log():
         return jsonify({"entries": list(market_log), "total": len(market_log), "source": "memory"})
 
 
+TELEGRAM_BOT_TOKEN = "8644473126:AAE4cDaIM25LCg9eXIcZE1kxXABmXzGUA5k"
+TELEGRAM_CHAT_ID = "761610515"
+SITE_URL = "https://price-swing-monitor.onrender.com/"
+
+
+def _format_telegram_message(markets: list[dict]) -> str:
+    """Format a list of swing markets into a Telegram message (HTML mode)."""
+    from html import escape as h
+    lines = ["\U0001F6A8 <b>Price Swing Alert</b>", ""]
+
+    for r in markets:
+        sport = h(r.get("sport", ""))
+        question = h(r.get("market_question", r.get("event_title", "")))
+        url = r.get("polymarket_url", "")
+        vol = r.get("volume", 0)
+        live_m = r.get("live_minutes")
+        live_str = ""
+        if live_m is not None:
+            if live_m < 60:
+                live_str = f" | Live {live_m}m"
+            else:
+                live_str = f" | Live {live_m // 60}h {live_m % 60}m"
+
+        vol_str = _tg_fmt_num(vol)
+        lines.append(f"<b>{sport}</b> | Vol ${vol_str}{live_str}")
+        if url:
+            lines.append(f'<a href="{url}">{question}</a>')
+        else:
+            lines.append(question)
+
+        for o in r.get("outcomes", []):
+            name = h(o.get("name", "?"))
+            pre = o.get("pre_match_price")
+            cur = o.get("current_price")
+            change = o.get("change_cents")
+            pre_s = f"{pre*100:.1f}" if pre is not None else "-"
+            cur_s = f"{cur*100:.1f}" if cur is not None else "-"
+            chg_s = ""
+            if change is not None:
+                sign = "+" if change > 0 else ""
+                chg_s = f" ({sign}{change:.1f}c)"
+            lines.append(f"  {name}: {pre_s}c \u2192 {cur_s}c{chg_s}")
+        lines.append("")
+
+    lines.append(f'<a href="{SITE_URL}">Open Monitor</a>')
+    return "\n".join(lines)
+
+
+def _tg_fmt_num(n) -> str:
+    if n is None:
+        return "?"
+    if n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n/1e3:.1f}K"
+    return str(round(n))
+
+
+def send_telegram(text: str) -> dict:
+    """Send a message via Telegram Bot API. Returns the API response."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        logger.error("Telegram send error: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+@app.route("/api/telegram-send", methods=["POST"])
+def api_telegram_send():
+    """Send swing markets to Telegram. Expects JSON body with {markets: [...]}."""
+    data = req.get_json(silent=True) or {}
+    markets = data.get("markets", [])
+    if not markets:
+        return jsonify({"ok": False, "error": "No markets provided"}), 400
+
+    text = _format_telegram_message(markets)
+    result = send_telegram(text)
+    return jsonify(result)
+
+
+@app.route("/api/telegram-test", methods=["POST"])
+def api_telegram_test():
+    """Send a test message with fake market data."""
+    fake_markets = [
+        {
+            "sport": "CS2",
+            "market_question": "CS2: Team Alpha vs Team Beta (BO3)",
+            "polymarket_url": "https://polymarket.com/event/test-market",
+            "volume": 85000,
+            "live_minutes": 47,
+            "outcomes": [
+                {"name": "Team Alpha", "pre_match_price": 0.72, "current_price": 0.35, "change_cents": -37.0},
+                {"name": "Team Beta", "pre_match_price": 0.28, "current_price": 0.65, "change_cents": 37.0},
+            ],
+        },
+        {
+            "sport": "NBA",
+            "market_question": "Lakers vs Celtics",
+            "polymarket_url": "https://polymarket.com/event/test-nba",
+            "volume": 250000,
+            "live_minutes": 92,
+            "outcomes": [
+                {"name": "Lakers", "pre_match_price": 0.68, "current_price": 0.30, "change_cents": -38.0},
+                {"name": "Celtics", "pre_match_price": 0.32, "current_price": 0.70, "change_cents": 38.0},
+            ],
+        },
+    ]
+    text = _format_telegram_message(fake_markets)
+    result = send_telegram(text)
+    return jsonify(result)
+
+
 @app.route("/api/db-test")
 def api_db_test():
     if not _db_available:

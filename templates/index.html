@@ -238,9 +238,19 @@
     <h1>Price Swing <span>Monitor</span></h1>
     <p class="subtitle">Live Polymarket sports moneyline markets — in-match price swings</p>
   </div>
-  <div class="sound-toggle on" id="soundToggle" onclick="toggleSound()">
-    <span class="sound-icon" id="soundIcon">&#128264;</span>
-    <span id="soundLabel">Sound ON</span>
+  <div style="display:flex; gap:8px; align-items:flex-start;">
+    <div class="sound-toggle on" id="soundToggle" onclick="toggleSound()">
+      <span class="sound-icon" id="soundIcon">&#128264;</span>
+      <span id="soundLabel">Sound ON</span>
+    </div>
+    <div class="sound-toggle" id="tgToggle" onclick="toggleTelegram()">
+      <span class="sound-icon">&#9992;</span>
+      <span id="tgLabel">TG OFF</span>
+    </div>
+    <div class="sound-toggle" id="tgTestBtn" onclick="testTelegram()" title="Send test message">
+      <span class="sound-icon">&#128172;</span>
+      <span>Test TG</span>
+    </div>
   </div>
 </div>
 
@@ -322,6 +332,7 @@ let monitoring = false;
 let timer = null;
 let scanning = false;
 let soundEnabled = true;
+let telegramEnabled = false;
 let knownSwingIds = new Set();  // condition_ids of swing markets we've already seen
 
 function $(id) { return document.getElementById(id); }
@@ -354,6 +365,53 @@ function playSwingAlert() {
       osc.stop(ctx.currentTime + i * 0.15 + 0.25);
     });
   } catch (e) { /* ignore audio errors */ }
+}
+
+// ── Telegram ──
+function toggleTelegram() {
+  telegramEnabled = !telegramEnabled;
+  const el = $('tgToggle');
+  el.classList.toggle('on', telegramEnabled);
+  $('tgLabel').textContent = telegramEnabled ? 'TG ON' : 'TG OFF';
+}
+
+async function sendTelegram(markets) {
+  if (!telegramEnabled || !markets.length) return;
+  try {
+    const resp = await fetch('/api/telegram-send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({markets}),
+    });
+    const data = await resp.json();
+    if (!data.ok) console.error('Telegram error:', data);
+  } catch (e) {
+    console.error('Telegram send failed:', e);
+  }
+}
+
+async function testTelegram() {
+  const btn = $('tgTestBtn');
+  btn.style.opacity = '0.4';
+  btn.style.pointerEvents = 'none';
+  try {
+    const resp = await fetch('/api/telegram-test', {method: 'POST'});
+    const data = await resp.json();
+    if (data.ok) {
+      btn.querySelector('span:last-child').textContent = 'Sent!';
+    } else {
+      btn.querySelector('span:last-child').textContent = 'Failed';
+      console.error('TG test error:', data);
+    }
+  } catch (e) {
+    btn.querySelector('span:last-child').textContent = 'Error';
+    console.error(e);
+  }
+  setTimeout(() => {
+    btn.querySelector('span:last-child').textContent = 'Test TG';
+    btn.style.opacity = '';
+    btn.style.pointerEvents = '';
+  }, 2000);
 }
 
 // ── Helpers ──
@@ -409,6 +467,9 @@ async function doScan() {
     );
     if (newSwings.length > 0) {
       playSwingAlert();
+      // Send ALL current qualified markets (not just new ones) via Telegram
+      const allQualified = (data.results || []).filter(r => r.qualified);
+      sendTelegram(allQualified);
       for (const r of newSwings) knownSwingIds.add(r.condition_id);
     }
 
