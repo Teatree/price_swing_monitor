@@ -1,6 +1,14 @@
 """
 Price Swing Monitor — Polymarket Sports Markets
-Finds markets where a favored outcome's price crashed after the market ended.
+Shows LIVE sports moneyline markets and tracks price swings during the match.
+
+Live detection (Option C — "breakout from stability"):
+  1. Fetch the last 8h of 5-minute price history for the first token
+  2. Walk backwards to find the last "stable" plateau: a stretch of >=6
+     consecutive points (≥30 min) where all prices are within ±2c of each other
+  3. The stable price = median of that plateau = pre-match line
+  4. If the current price has moved >=5c from the stable price, the match is LIVE
+  5. Pre-match markets (price still near the plateau) are skipped
 """
 
 import os
@@ -9,6 +17,7 @@ import time
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import Lock
+from statistics import median
 
 import requests
 from flask import Flask, render_template, jsonify, request as req
@@ -19,13 +28,17 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Init DB on startup (no-op if DATABASE_URL not set)
 with app.app_context():
     _db_available = init_db()
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
-DELAY = 0.2  # seconds between CLOB API calls
+DELAY = 0.2
+
+# Live detection parameters
+STABLE_BAND_CENTS = 2      # max ±2c variation to count as "stable"
+STABLE_MIN_POINTS = 6      # minimum 6 data points (~30 min at 5-min fidelity)
+BREAKOUT_CENTS = 5          # current price must be >=5c away from stable price
 
 # ---------------------------------------------------------------------------
 # Sport → Polymarket series IDs (from /sports endpoint)
@@ -42,18 +55,18 @@ SPORT_SERIES = {
 }
 
 # ---------------------------------------------------------------------------
-# In-memory log of qualified markets
+# In-memory log
 # ---------------------------------------------------------------------------
 market_log: list[dict] = []
 seen_conditions: set[str] = set()
 _log_lock = Lock()
+MAX_MEMORY_LOG = 500  # cap in-memory log to prevent unbounded growth
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _parse(val):
-    """Parse a JSON-string field from Gamma API."""
     if isinstance(val, str):
         try:
             return json.loads(val)
@@ -62,11 +75,19 @@ def _parse(val):
     return val
 
 
-def _iso_to_dt(s: str | None):
+def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S%z")
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(s + "+00:00", "%Y-%m-%d %H:%M:%S%z")
     except Exception:
         return None
 
@@ -74,23 +95,19 @@ def _iso_to_dt(s: str | None):
 # Gamma API
 # ---------------------------------------------------------------------------
 
-def fetch_events(series_id: int, *, closed: bool, cutoff_dt=None,
-                  limit: int = 50) -> list[dict]:
-    """Paginated fetch of events for one series_id.
-    Stops early if all events are older than cutoff_dt."""
+def fetch_active_events(series_id: int, limit: int = 50) -> list[dict]:
     out = []
     offset = 0
     while offset < 500:
         params = {
             "series_id": str(series_id),
-            "closed": str(closed).lower(),
+            "active": "true",
+            "closed": "false",
             "order": "endDate",
             "ascending": "false",
             "limit": limit,
             "offset": offset,
         }
-        if not closed:
-            params["active"] = "true"
         try:
             r = requests.get(f"{GAMMA}/events", params=params, timeout=15)
             r.raise_for_status()
@@ -101,13 +118,6 @@ def fetch_events(series_id: int, *, closed: bool, cutoff_dt=None,
         if not batch:
             break
         out.extend(batch)
-
-        # Early exit: if last event in batch is older than cutoff, stop paging
-        if cutoff_dt and batch:
-            last_end = _iso_to_dt(batch[-1].get("endDate"))
-            if last_end and last_end < cutoff_dt:
-                break
-
         if len(batch) < limit:
             break
         offset += len(batch)
@@ -119,7 +129,6 @@ def fetch_events(series_id: int, *, closed: bool, cutoff_dt=None,
 # ---------------------------------------------------------------------------
 
 def clob_price(token_id: str) -> float | None:
-    """Current best-ask price via REST."""
     try:
         r = requests.get(f"{CLOB}/price",
                          params={"token_id": token_id, "side": "BUY"}, timeout=5)
@@ -129,7 +138,6 @@ def clob_price(token_id: str) -> float | None:
 
 
 def clob_book_depth(token_id: str, levels: int = 5) -> float:
-    """Total shares across top N ask levels."""
     try:
         r = requests.get(f"{CLOB}/book",
                          params={"token_id": token_id}, timeout=5)
@@ -139,27 +147,92 @@ def clob_book_depth(token_id: str, levels: int = 5) -> float:
         return 0.0
 
 
-def clob_pre_end_price(token_id: str, end_unix: int) -> float | None:
-    """
-    Price just before market end, from CLOB /prices-history.
-    Uses explicit startTs/endTs (interval=max is buggy for resolved markets).
-    """
+def clob_price_history(token_id: str, now_unix: int) -> list[float]:
+    """Fetch last 8 hours of price data at 5-minute intervals.
+    Returns list of prices (floats), newest last."""
     try:
         r = requests.get(f"{CLOB}/prices-history", params={
             "market": token_id,
-            "startTs": end_unix - 86400,   # 24 h before end
-            "endTs": end_unix,
-            "fidelity": 10,                # 10-min data points
+            "startTs": now_unix - 28800,   # 8h ago
+            "endTs":   now_unix,
+            "fidelity": 5,                 # 5-min data points
         }, timeout=10)
         if r.status_code != 200:
-            return None
+            return []
         history = r.json().get("history", [])
-        if not history:
-            return None
-        return float(history[-1].get("p", 0))
+        return [float(pt.get("p", 0)) for pt in history]
     except Exception as e:
         logger.debug("prices-history error %s: %s", token_id, e)
+        return []
+
+
+def find_stable_price(prices: list[float]) -> float | None:
+    """Walk backwards through price history to find the last stable plateau.
+
+    A plateau is STABLE_MIN_POINTS (6) consecutive prices where
+    max - min <= STABLE_BAND_CENTS/100. Returns the median of that plateau,
+    or None if no stable region is found.
+    """
+    if len(prices) < STABLE_MIN_POINTS:
         return None
+
+    band = STABLE_BAND_CENTS / 100
+
+    # Walk backwards from the end of the history
+    # We want the LAST stable region before the current volatility
+    # Start from the end and try to find where volatility begins,
+    # then look for stability before that.
+    for end in range(len(prices) - 1, STABLE_MIN_POINTS - 2, -1):
+        # Check if [end - STABLE_MIN_POINTS + 1 .. end] is stable
+        start = end - STABLE_MIN_POINTS + 1
+        window = prices[start:end + 1]
+        if max(window) - min(window) <= band:
+            # Found a stable region — now extend it backwards as far as possible
+            while start > 0 and max(prices[start - 1:end + 1]) - min(prices[start - 1:end + 1]) <= band:
+                start -= 1
+            plateau = prices[start:end + 1]
+            return round(median(plateau), 4)
+
+    return None
+
+
+def detect_live(prices: list[float], current_price: float):
+    """Determine if a market is live using the breakout-from-stability method.
+
+    Returns (is_live: bool, stable_price: float|None).
+    - stable_price is the pre-match line (median of last stable plateau)
+    - is_live is True if current price has broken out >=5c from stable
+    """
+    stable = find_stable_price(prices)
+    if stable is None:
+        return False, None
+
+    movement = abs(current_price - stable)
+    is_live = movement >= (BREAKOUT_CENTS / 100)
+    return is_live, stable
+
+# ---------------------------------------------------------------------------
+# Moneyline detection
+# ---------------------------------------------------------------------------
+
+EXCLUDE_KW = [
+    "o/u", "over", "under", "spread", "handicap", "total",
+    "game 1", "game 2", "game 3", "game 4", "game 5",
+    "game 6", "game 7", "map 1", "map 2", "map 3",
+    "map 4", "map 5", "set 1", "set 2", "set 3",
+    "1h ", "rushing", "receiving", "touchdown",
+    "passing", "assists", "rebounds", "points scored",
+    "odd/even", "odd or even",
+]
+
+
+def _is_moneyline(question: str, outcomes: list) -> bool:
+    if set(outcomes) == {"Yes", "No"}:
+        return False
+    q = question.lower()
+    if any(kw in q for kw in EXCLUDE_KW):
+        return False
+    return "vs" in q or "match winner" in q
 
 # ---------------------------------------------------------------------------
 # Core scan
@@ -167,54 +240,52 @@ def clob_pre_end_price(token_id: str, end_unix: int) -> float | None:
 
 def scan_markets(
     sports: list[str],
-    hours: float = 3.0,
     min_volume: float = 10_000,
     min_shares: float = 0,
     start_price_min: float = 0.68,
     current_price_max: float = 0.40,
 ) -> list[dict]:
+    """Find live moneyline markets using breakout-from-stability detection."""
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
+    now_unix = int(now.timestamp())
     results: list[dict] = []
     seen_cids: set[str] = set()
 
     for sport in sports:
         series_ids = SPORT_SERIES.get(sport, [])
         for sid in series_ids:
-            # Fetch both closed and still-active-but-ended events
-            for closed in (True, False):
-                events = fetch_events(sid, closed=closed, cutoff_dt=cutoff)
-                logger.info("  %s series=%s closed=%s → %d events",
-                            sport, sid, closed, len(events))
-                total_markets = 0
-                for event in events:
-                    for market in event.get("markets") or []:
-                        total_markets += 1
-                        cid = market.get("conditionId", "")
-                        if cid in seen_cids:
-                            continue
-                        seen_cids.add(cid)
-                        r = _process_market(market, event, sport,
-                                            now, cutoff,
-                                            min_volume, min_shares,
-                                            start_price_min, current_price_max)
-                        if r:
-                            results.append(r)
-                logger.info("    → %d total markets in those events", total_markets)
-    logger.info("Scan complete: %d qualifying markets", len(results))
+            events = fetch_active_events(sid)
+            logger.info("  %s series=%s → %d active events", sport, sid, len(events))
+            mkt_count = 0
+            live_count = 0
+            for event in events:
+                for market in event.get("markets") or []:
+                    mkt_count += 1
+                    cid = market.get("conditionId", "")
+                    if cid in seen_cids:
+                        continue
+                    seen_cids.add(cid)
+                    r = _process_market(market, event, sport, now, now_unix,
+                                        min_volume, min_shares,
+                                        start_price_min, current_price_max)
+                    if r:
+                        live_count += 1
+                        results.append(r)
+            logger.info("    → %d markets checked, %d live", mkt_count, live_count)
+    logger.info("Scan complete: %d live markets", len(results))
     return results
 
 
-def _process_market(market, event, sport, now, cutoff,
+def _process_market(market, event, sport, now, now_unix,
                     min_volume, min_shares, start_min, cur_max):
-    """Return a result dict if this market qualifies, else None."""
+    """Return a result dict for live moneyline markets.
+    Uses breakout-from-stability to detect if match is in progress."""
 
-    # --- end-date filter ---
-    end_dt = _iso_to_dt(market.get("endDate"))
-    if not end_dt or end_dt > now or end_dt < cutoff:
+    # --- Hard filters ---
+
+    if market.get("closed"):
         return None
 
-    # --- volume filter (cheap, no API call) ---
     try:
         vol = float(market.get("volumeNum") or 0)
     except (TypeError, ValueError):
@@ -222,126 +293,123 @@ def _process_market(market, event, sport, now, cutoff,
     if vol < min_volume:
         return None
 
-    # --- parse outcomes / tokens ---
     outcomes = _parse(market.get("outcomes"))
     tokens   = _parse(market.get("clobTokenIds"))
     if not outcomes or not tokens or len(outcomes) != len(tokens):
         return None
 
-    # --- skip player-prop style Yes/No (individual player markets) ---
-    if set(outcomes) == {"Yes", "No"}:
+    question = market.get("question") or ""
+    if not _is_moneyline(question, outcomes):
         return None
 
-    # --- Moneyline / team-win filter ---
-    # Only keep markets where two (or three) teams compete to win.
-    # These have "vs" in the question or are labelled "Match Winner".
-    # Exclude O/U, Spread, Handicap, Game/Map/Set sub-markets, 1H, props.
-    q = (market.get("question") or "").lower()
-    EXCLUDE_KW = ["o/u", "over", "under", "spread", "handicap", "total",
-                  "game 1", "game 2", "game 3", "game 4", "game 5",
-                  "game 6", "game 7", "map 1", "map 2", "map 3",
-                  "map 4", "map 5", "set 1", "set 2", "set 3",
-                  "1h ", "rushing", "receiving", "touchdown",
-                  "passing", "assists", "rebounds", "points scored"]
-    if any(kw in q for kw in EXCLUDE_KW):
-        return None
-    if "vs" not in q and "match winner" not in q:
-        return None
+    # --- Fetch current best-ask prices from CLOB ---
 
-    # --- current prices (from Gamma outcomePrices first, CLOB fallback) ---
-    gamma_prices = _parse(market.get("outcomePrices"))
     current: list[float | None] = []
-    if gamma_prices and len(gamma_prices) == len(outcomes):
-        current = [float(p) for p in gamma_prices]
-    else:
-        for tok in tokens:
-            current.append(clob_price(tok))
-            time.sleep(DELAY)
-
-    # --- pre-end prices from CLOB history ---
-    end_unix = int(end_dt.timestamp())
-    pre_end: list[float | None] = []
-
-    # Optimisation: for 2-outcome markets, fetch only first token
-    if len(tokens) == 2:
-        p0 = clob_pre_end_price(tokens[0], end_unix)
+    for tok in tokens:
+        current.append(clob_price(tok))
         time.sleep(DELAY)
-        pre_end = [p0, round(1 - p0, 4) if p0 is not None else None]
-    else:
-        for tok in tokens:
-            pre_end.append(clob_pre_end_price(tok, end_unix))
-            time.sleep(DELAY)
 
-    # Fallback: if history unavailable but market is resolved (closed),
-    # we know the current gamma prices ARE the resolved prices (0/1).
-    # Invert them to estimate pre-end: the loser was likely the favorite.
-    if all(p is None for p in pre_end) and gamma_prices:
-        gp = [float(p) for p in gamma_prices]
-        if market.get("closed"):
-            # Resolved: current gamma = resolution (1/0).
-            # Can't reliably recover pre-end price → skip.
-            pass
+    # Skip if any outcome >= 99c (match effectively decided)
+    if any(c is not None and c >= 0.99 for c in current):
+        return None
+
+    # --- Live detection via price history on first token ---
+    cur0 = current[0] if current else None
+    if cur0 is None:
+        return None
+
+    history = clob_price_history(tokens[0], now_unix)
+    time.sleep(DELAY)
+
+    is_live, stable_price = detect_live(history, cur0)
+    if not is_live:
+        return None
+
+    # --- Build pre-match prices from stable price ---
+    # stable_price is for token[0]. For 2-outcome markets, token[1] = 1 - token[0]
+    pre_match: list[float | None] = []
+    if stable_price is not None:
+        pre_match.append(stable_price)
+        if len(tokens) == 2:
+            pre_match.append(round(1 - stable_price, 4))
         else:
-            # Active but ended: gamma prices are still live trading prices.
-            # We don't have history, so pre-end is unknown → skip.
-            pass
+            # For 3+ outcomes, fetch history for each additional token
+            for tok in tokens[1:]:
+                h = clob_price_history(tok, now_unix)
+                time.sleep(DELAY)
+                s = find_stable_price(h)
+                pre_match.append(s)
+    else:
+        pre_match = [None] * len(tokens)
 
-    # --- build outcome list ---
+    # --- Build outcome list ---
     outcome_data = []
     for i, (name, tok) in enumerate(zip(outcomes, tokens)):
         cur = current[i] if i < len(current) else None
-        pre = pre_end[i] if i < len(pre_end) else None
-        pct = None
-        if pre and pre > 0 and cur is not None:
-            pct = round(((cur - pre) / pre) * 100, 1)
+        pre = pre_match[i] if i < len(pre_match) else None
+        change = None
+        if pre is not None and cur is not None:
+            change = round((cur - pre) * 100, 1)
         outcome_data.append({
             "name": name,
             "token_id": tok,
             "current_price": cur,
-            "pre_end_price": pre,
-            "pct_change": pct,
+            "pre_match_price": pre,
+            "change_cents": change,
         })
 
-    # --- price-swing filters ---
-    # Highest pre-end price must exceed start_min
-    pre_vals = [o["pre_end_price"] for o in outcome_data if o["pre_end_price"] is not None]
+    # --- Soft filters (swing criteria — flag but don't discard) ---
+    qualified = True
+    disqualify_reason = None
+
+    pre_vals = [o["pre_match_price"] for o in outcome_data if o["pre_match_price"] is not None]
     if not pre_vals:
-        return None  # can't evaluate without history
-    max_pre = max(pre_vals)
-    if max_pre < start_min:
-        return None
+        qualified = False
+        disqualify_reason = "No pre-match price available"
+    else:
+        max_pre = max(pre_vals)
+        fav_idx = next(i for i, o in enumerate(outcome_data) if o["pre_match_price"] == max_pre)
+        fav_cur = outcome_data[fav_idx]["current_price"]
 
-    # The previously-favored outcome's current price must be below cur_max
-    fav_idx = next(i for i, o in enumerate(outcome_data) if o["pre_end_price"] == max_pre)
-    fav_cur = outcome_data[fav_idx]["current_price"]
-    if fav_cur is None or fav_cur >= cur_max:
-        return None
+        if max_pre < start_min:
+            qualified = False
+            disqualify_reason = f"Pre-match fav {max_pre*100:.0f}\u00a2 < {start_min*100:.0f}\u00a2 threshold"
+        elif fav_cur is None:
+            qualified = False
+            disqualify_reason = "Current price unavailable"
+        elif fav_cur >= cur_max:
+            qualified = False
+            disqualify_reason = f"Fav now {fav_cur*100:.0f}\u00a2 \u2265 {cur_max*100:.0f}\u00a2 threshold"
 
-    # --- depth filter (only for qualifying markets) ---
-    if min_shares > 0:
+    # Depth filter only for qualified
+    if qualified and min_shares > 0:
         for o in outcome_data:
             d = clob_book_depth(o["token_id"])
             o["shares_available"] = d
             time.sleep(DELAY)
             if d < min_shares:
-                return None
+                qualified = False
+                disqualify_reason = f"Insufficient depth ({d:.0f} < {min_shares:.0f} shares)"
+                break
 
-    # --- build result ---
+    # --- Build result ---
     event_slug = event.get("slug", "")
+
     result = {
         "event_title": event.get("title", ""),
-        "market_question": market.get("question", ""),
+        "market_question": question,
         "condition_id": market.get("conditionId", ""),
         "sport": sport,
-        "end_date": market.get("endDate"),
-        "end_dt_unix": end_unix,
+        "game_start": market.get("gameStartTime"),
         "polymarket_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "volume": vol,
         "outcomes": outcome_data,
-        "closed": bool(market.get("closed")),
+        "qualified": qualified,
+        "disqualify_reason": disqualify_reason,
     }
 
-    _log_if_new(result)
+    if qualified:
+        _log_if_new(result)
     return result
 
 # ---------------------------------------------------------------------------
@@ -353,10 +421,8 @@ def _log_if_new(result: dict):
     if not cid:
         return
 
-    # Write to Postgres (upserts — safe to call repeatedly)
     insert_swing(result)
 
-    # Also keep in-memory copy
     with _log_lock:
         if cid in seen_conditions:
             return
@@ -368,12 +434,16 @@ def _log_if_new(result: dict):
             "volume": result["volume"],
         }
         for i, o in enumerate(result["outcomes"]):
-            label = o["name"]
-            entry[f"outcome_{i+1}_name"] = label
-            entry[f"outcome_{i+1}_pre"] = o["pre_end_price"]
+            entry[f"outcome_{i+1}_name"] = o["name"]
+            entry[f"outcome_{i+1}_pre"] = o["pre_match_price"]
             entry[f"outcome_{i+1}_cur"] = o["current_price"]
         market_log.append(entry)
-
+        # Cap in-memory log
+        if len(market_log) > MAX_MEMORY_LOG:
+            market_log[:] = market_log[-MAX_MEMORY_LOG:]
+        # Cap seen set (old entries don't matter — DB handles dedup)
+        if len(seen_conditions) > 2000:
+            seen_conditions.clear()
 
 # ---------------------------------------------------------------------------
 # Flask routes
@@ -387,76 +457,42 @@ def index():
 @app.route("/api/scan")
 def api_scan():
     sports = [s for s in req.args.get("sports", "CS2,Dota2,Valorant,LoL,Soccer,NFL,NBA,NHL").split(",") if s]
-    hours           = float(req.args.get("hours", 3))
     min_volume      = float(req.args.get("min_volume", 10000))
     min_shares      = float(req.args.get("min_shares", 0))
     start_price_min = float(req.args.get("start_price_min", 68)) / 100
     current_price_max = float(req.args.get("current_price_max", 40)) / 100
 
     t0 = time.time()
-    results = scan_markets(sports, hours, min_volume, min_shares,
+    results = scan_markets(sports, min_volume, min_shares,
                            start_price_min, current_price_max)
     elapsed = round(time.time() - t0, 1)
 
-    # Sort: biggest swing first (most negative pct_change)
-    results.sort(key=lambda r: min(
-        (o["pct_change"] for o in r["outcomes"] if o["pct_change"] is not None),
+    qualified = [r for r in results if r.get("qualified")]
+    dimmed    = [r for r in results if not r.get("qualified")]
+
+    # Qualified: biggest absolute swing first
+    qualified.sort(key=lambda r: min(
+        (o["change_cents"] for o in r["outcomes"] if o["change_cents"] is not None),
         default=0,
     ))
+    # Dimmed: by volume (most liquid first)
+    dimmed.sort(key=lambda r: r.get("volume", 0), reverse=True)
 
     return jsonify({
-        "results": results,
-        "count": len(results),
+        "results": qualified + dimmed,
+        "count_qualified": len(qualified),
+        "count_total": len(results),
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_s": elapsed,
     })
 
 
-@app.route("/api/debug")
-def api_debug():
-    """Show raw recently-ended moneyline markets before price filters apply."""
-    sports = [s for s in req.args.get("sports", "CS2,Dota2,Valorant,LoL,Soccer,NFL,NBA,NHL").split(",") if s]
-    hours = float(req.args.get("hours", 3))
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
-    found = []
-
-    for sport in sports:
-        for sid in SPORT_SERIES.get(sport, []):
-            for closed in (True, False):
-                events = fetch_events(sid, closed=closed, cutoff_dt=cutoff)
-                for event in events:
-                    for mkt in event.get("markets") or []:
-                        end_dt = _iso_to_dt(mkt.get("endDate"))
-                        if not end_dt or end_dt > now or end_dt < cutoff:
-                            continue
-                        q = (mkt.get("question") or "")
-                        outcomes = _parse(mkt.get("outcomes"))
-                        gamma_prices = _parse(mkt.get("outcomePrices"))
-                        vol = float(mkt.get("volumeNum") or 0)
-                        found.append({
-                            "sport": sport,
-                            "question": q,
-                            "outcomes": outcomes,
-                            "gamma_prices": gamma_prices,
-                            "volume": vol,
-                            "closed": mkt.get("closed"),
-                            "end_date": mkt.get("endDate"),
-                            "is_moneyline": "vs" in q.lower() or "match winner" in q.lower(),
-                        })
-
-    return jsonify({"count": len(found), "markets": found})
-
-
 @app.route("/api/log")
 def api_log():
-    # Prefer Postgres, fall back to in-memory
     if _db_available:
         sport = req.args.get("sport")
         limit = int(req.args.get("limit", 200))
         rows = get_all_swings(limit=limit, sport=sport)
-        # Serialize datetimes
         for r in rows:
             for k, v in r.items():
                 if isinstance(v, datetime):
@@ -468,7 +504,6 @@ def api_log():
 
 @app.route("/api/db-test")
 def api_db_test():
-    """Quick check that Postgres is connected and working."""
     if not _db_available:
         return jsonify({"ok": False, "error": "DATABASE_URL not set"}), 503
     try:

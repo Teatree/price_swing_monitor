@@ -14,6 +14,7 @@
     --text: #fafafa; --muted: #a1a1aa; --dim: #71717a;
     --accent: #f97316; --accent-dim: #c2410c;
     --green: #22c55e; --red: #ef4444; --blue: #3b82f6;
+    --yellow: #eab308;
   }
 
   body {
@@ -22,9 +23,20 @@
     line-height: 1.5; padding: 20px; max-width: 1200px; margin: 0 auto;
   }
 
-  h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 4px; }
-  h1 span { color: var(--accent); }
-  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 20px; }
+  .top-bar { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+  .top-bar-left h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 4px; }
+  .top-bar-left h1 span { color: var(--accent); }
+  .top-bar-left .subtitle { color: var(--muted); font-size: 0.85rem; }
+
+  .sound-toggle {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 14px; cursor: pointer; user-select: none;
+    font-size: 0.8rem; color: var(--muted); transition: border-color 0.15s;
+  }
+  .sound-toggle:hover { border-color: var(--border-hi); }
+  .sound-toggle.on { border-color: var(--accent); color: var(--text); }
+  .sound-icon { font-size: 1.1rem; }
 
   /* ── Controls ── */
   .controls {
@@ -99,46 +111,80 @@
     border: 1px dashed var(--border); border-radius: 12px; font-size: 0.9rem;
   }
 
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .section-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--dim); margin: 20px 0 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-label:first-child { margin-top: 0; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(370px, 1fr)); gap: 14px; }
 
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
     padding: 16px; transition: border-color 0.2s;
   }
   .card:hover { border-color: var(--border-hi); }
+  .card-dimmed { opacity: 0.45; }
+  .card-dimmed:hover { opacity: 0.65; border-color: var(--border-hi); }
+
+  .card-top-row {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    margin-bottom: 4px;
+  }
   .card-sport {
     font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--accent); font-weight: 600; margin-bottom: 4px;
+    color: var(--accent); font-weight: 600;
   }
+  .card-badge {
+    font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 2px 7px; border-radius: 4px; font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .badge-swing    { background: rgba(239,68,68,0.2); color: var(--red); }
+  .badge-live     { background: rgba(34,197,94,0.2); color: var(--green); }
+
   .card-title {
     font-weight: 600; font-size: 0.95rem; margin-bottom: 2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .card-title a { color: var(--text); text-decoration: none; }
   .card-title a:hover { color: var(--accent); }
+
   .card-meta {
-    font-size: 0.75rem; color: var(--dim); margin-bottom: 12px;
+    font-size: 0.72rem; color: var(--dim); margin-bottom: 10px;
     font-family: 'JetBrains Mono', monospace;
+    display: flex; flex-wrap: wrap; gap: 4px 12px;
+  }
+
+  .card-reason {
+    font-size: 0.7rem; color: var(--dim); font-style: italic;
+    margin-bottom: 8px;
   }
 
   .outcome-row {
-    display: grid; grid-template-columns: 1fr auto auto auto;
-    align-items: center; gap: 8px; padding: 8px 0;
-    border-top: 1px solid var(--border); font-size: 0.85rem;
+    display: grid; grid-template-columns: 1fr auto auto auto auto;
+    align-items: center; gap: 6px; padding: 7px 0;
+    border-top: 1px solid var(--border); font-size: 0.84rem;
   }
-  .outcome-name { font-weight: 500; }
+  .outcome-name {
+    font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .outcome-fav { color: var(--yellow); }
   .price {
     font-family: 'JetBrains Mono', monospace; font-weight: 600;
-    text-align: right; font-size: 0.85rem;
+    text-align: right; font-size: 0.84rem;
   }
   .price-pre { color: var(--muted); }
   .arrow { color: var(--dim); font-size: 0.7rem; }
   .pct {
     font-family: 'JetBrains Mono', monospace; font-weight: 600;
-    font-size: 0.8rem; min-width: 65px; text-align: right;
+    font-size: 0.78rem; min-width: 60px; text-align: right;
   }
   .pct-neg { color: var(--red); }
   .pct-pos { color: var(--green); }
+  .pct-na  { color: var(--dim); }
 
   /* ── Log ── */
   .log-section { margin-top: 32px; }
@@ -172,7 +218,6 @@
 
   .hidden { display: none; }
 
-  /* ── Loading overlay ── */
   .loading-bar {
     height: 3px; background: linear-gradient(90deg, transparent, var(--accent), transparent);
     position: fixed; top: 0; left: 0; right: 0; z-index: 100;
@@ -188,8 +233,16 @@
 
 <div id="loadingBar" class="loading-bar hidden"></div>
 
-<h1>Price Swing <span>Monitor</span></h1>
-<p class="subtitle">Polymarket sports markets — post-event price crashes</p>
+<div class="top-bar">
+  <div class="top-bar-left">
+    <h1>Price Swing <span>Monitor</span></h1>
+    <p class="subtitle">Live Polymarket sports moneyline markets — in-match price swings</p>
+  </div>
+  <div class="sound-toggle on" id="soundToggle" onclick="toggleSound()">
+    <span class="sound-icon" id="soundIcon">&#128264;</span>
+    <span id="soundLabel">Sound ON</span>
+  </div>
+</div>
 
 <!-- ── Controls ── -->
 <div class="controls">
@@ -207,16 +260,12 @@
       <input type="number" id="interval" value="60" min="15" step="5">
     </div>
     <div class="field">
-      <label>Starting Price (&gt;)</label>
+      <label>Pre-Match Fav (&gt;)</label>
       <input type="number" id="startPrice" value="68" min="1" max="99" step="1">
     </div>
     <div class="field">
-      <label>Current Price (&lt;)</label>
+      <label>Fav Now (&lt;)</label>
       <input type="number" id="curPrice" value="40" min="1" max="99" step="1">
-    </div>
-    <div class="field">
-      <label>Lookback (hours)</label>
-      <input type="number" id="hours" value="3" min="1" max="24" step="1">
     </div>
   </div>
 
@@ -240,27 +289,27 @@
 
 <!-- ── Results ── -->
 <div class="results-header">
-  <h2>Results</h2>
+  <h2>Live Markets</h2>
   <span class="results-count" id="resultsCount"></span>
 </div>
 <div id="resultsArea">
-  <div class="no-results" id="noResults">No markets scanned yet. Click <b>Scan Now</b> or <b>Start Monitoring</b>.</div>
+  <div class="no-results">No markets scanned yet. Click <b>Scan Now</b> or <b>Start Monitoring</b>.</div>
 </div>
 
 <!-- ── Log ── -->
 <div class="log-section">
   <button class="log-toggle" onclick="toggleLog()">
     <span class="log-arrow" id="logArrow">&#9654;</span>
-    Market Log (<span id="logCount">0</span> entries)
+    Swing Log (<span id="logCount">0</span> entries)
   </button>
   <div id="logBody" class="hidden">
     <div class="log-table-wrap">
       <table class="log-table">
         <thead><tr>
           <th>Timestamp</th><th>Sport</th><th>Market</th>
-          <th>Out 1</th><th>Pre</th><th>Cur</th>
-          <th>Out 2</th><th>Pre</th><th>Cur</th>
-          <th>Out 3</th><th>Pre</th><th>Cur</th>
+          <th>Out 1</th><th>Pre</th><th>Now</th>
+          <th>Out 2</th><th>Pre</th><th>Now</th>
+          <th>Out 3</th><th>Pre</th><th>Now</th>
         </tr></thead>
         <tbody id="logTableBody"></tbody>
       </table>
@@ -269,44 +318,65 @@
 </div>
 
 <script>
-// ── State ──
 let monitoring = false;
 let timer = null;
 let scanning = false;
+let soundEnabled = true;
+let knownSwingIds = new Set();  // condition_ids of swing markets we've already seen
 
-// ── Helpers ──
 function $(id) { return document.getElementById(id); }
 
+// ── Sound ──
+function toggleSound() {
+  soundEnabled = !soundEnabled;
+  const el = $('soundToggle');
+  el.classList.toggle('on', soundEnabled);
+  $('soundIcon').innerHTML = soundEnabled ? '&#128264;' : '&#128263;';
+  $('soundLabel').textContent = soundEnabled ? 'Sound ON' : 'Sound OFF';
+}
+
+function playSwingAlert() {
+  if (!soundEnabled) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // Two-tone alert: C5 then E5
+    const notes = [523.25, 659.25];
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.15 + 0.25);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + i * 0.15 + 0.25);
+    });
+  } catch (e) { /* ignore audio errors */ }
+}
+
+// ── Helpers ──
 function getParams() {
   const sports = [...document.querySelectorAll('.sport-check input:checked')].map(c => c.value);
   return {
-    sports:          sports.join(','),
-    hours:           $('hours').value,
-    min_volume:      $('minVolume').value,
-    min_shares:      $('minShares').value,
-    start_price_min: $('startPrice').value,
+    sports:            sports.join(','),
+    min_volume:        $('minVolume').value,
+    min_shares:        $('minShares').value,
+    start_price_min:   $('startPrice').value,
     current_price_max: $('curPrice').value,
   };
 }
 
 function centsStr(v) {
-  if (v == null) return '—';
-  return (v * 100).toFixed(1) + '¢';
+  if (v == null) return '\u2014';
+  return (v * 100).toFixed(1) + '\u00a2';
 }
 
-function pctStr(v) {
-  if (v == null) return '—';
-  const sign = v > 0 ? '+' : '';
-  return sign + v.toFixed(1) + '%';
-}
-
-function timeAgo(isoStr) {
-  const diff = Date.now() - new Date(isoStr).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return mins + 'm ago';
-  const hrs = Math.floor(mins / 60);
-  return hrs + 'h ' + (mins % 60) + 'm ago';
+function changeStr(cents) {
+  if (cents == null) return '\u2014';
+  const sign = cents > 0 ? '+' : '';
+  return sign + cents.toFixed(1) + '\u00a2';
 }
 
 function setStatus(text, dotClass) {
@@ -322,7 +392,7 @@ async function doScan() {
   if (scanning) return;
   scanning = true;
   setLoading(true);
-  setStatus('Scanning…', 'dot-scan');
+  setStatus('Scanning\u2026', 'dot-scan');
   $('btnScan').disabled = true;
 
   const params = getParams();
@@ -332,15 +402,26 @@ async function doScan() {
     const resp = await fetch('/api/scan?' + qs);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
+
+    // Check for new swing markets
+    const newSwings = (data.results || []).filter(r =>
+      r.qualified && !knownSwingIds.has(r.condition_id)
+    );
+    if (newSwings.length > 0) {
+      playSwingAlert();
+      for (const r of newSwings) knownSwingIds.add(r.condition_id);
+    }
+
     renderResults(data);
-    const elapsed = data.elapsed_s ? ` · ${data.elapsed_s}s` : '';
+    const elapsed = data.elapsed_s ? ` \u00b7 ${data.elapsed_s}s` : '';
+    const q = data.count_qualified || 0;
+    const t = data.count_total || 0;
     setStatus(
       monitoring
-        ? `Live · ${data.count} found${elapsed} · next in ${$('interval').value}s`
-        : `${data.count} found${elapsed} · ${new Date().toLocaleTimeString()}`,
+        ? `Live \u00b7 ${q} swings / ${t} markets${elapsed} \u00b7 next in ${$('interval').value}s`
+        : `${q} swings / ${t} live markets${elapsed} \u00b7 ${new Date().toLocaleTimeString()}`,
       monitoring ? 'dot-live' : 'dot-idle'
     );
-    // refresh log
     loadLog();
   } catch (e) {
     console.error(e);
@@ -355,52 +436,86 @@ async function doScan() {
 // ── Render ──
 function renderResults(data) {
   const area = $('resultsArea');
-  $('resultsCount').textContent = data.count + ' market' + (data.count !== 1 ? 's' : '');
+  const q = data.count_qualified || 0;
+  const t = data.count_total || 0;
+  $('resultsCount').textContent = `${q} swings / ${t} live`;
 
   if (!data.results || data.results.length === 0) {
-    area.innerHTML = '<div class="no-results">No price-swing markets found matching your filters.</div>';
+    area.innerHTML = '<div class="no-results">No live matches found. Games may not be in progress right now.</div>';
     return;
   }
 
-  let html = '<div class="cards">';
-  for (const r of data.results) {
-    html += `<div class="card">
-      <div class="card-sport">${esc(r.sport)}</div>
-      <div class="card-title">
-        <a href="${esc(r.polymarket_url)}" target="_blank" rel="noopener">${esc(r.market_question || r.event_title)}</a>
-      </div>
-      <div class="card-meta">
-        Ended ${timeAgo(r.end_date)} · Vol $${fmtNum(r.volume)}
-        ${r.closed ? ' · Resolved' : ''}
-      </div>`;
+  const qualified = data.results.filter(r => r.qualified);
+  const dimmed    = data.results.filter(r => !r.qualified);
 
-    for (const o of r.outcomes) {
-      const pctClass = (o.pct_change != null && o.pct_change < 0) ? 'pct-neg'
-                     : (o.pct_change != null && o.pct_change > 0) ? 'pct-pos' : '';
-      html += `<div class="outcome-row">
-        <span class="outcome-name">${esc(o.name)}</span>
-        <span class="price price-pre">${centsStr(o.pre_end_price)}</span>
-        <span class="arrow">→</span>
-        <span class="price">${centsStr(o.current_price)}</span>
-      </div>`;
-    }
+  let html = '';
 
-    // Summary row: biggest swing
-    const swings = r.outcomes.filter(o => o.pct_change != null);
-    if (swings.length) {
-      const biggest = swings.reduce((a, b) =>
-        Math.abs(a.pct_change) > Math.abs(b.pct_change) ? a : b);
-      const cls = biggest.pct_change < 0 ? 'pct-neg' : 'pct-pos';
-      html += `<div style="text-align:right; margin-top:8px;">
-        <span class="pct ${cls}">${pctStr(biggest.pct_change)}</span>
-        <span style="color:var(--dim); font-size:0.7rem; margin-left:4px;">${esc(biggest.name)}</span>
-      </div>`;
-    }
-
+  if (qualified.length > 0) {
+    html += `<div class="section-label">Swing matches (${qualified.length})</div>`;
+    html += '<div class="cards">';
+    for (const r of qualified) html += renderCard(r, false);
     html += '</div>';
   }
-  html += '</div>';
+
+  if (dimmed.length > 0) {
+    html += `<div class="section-label">Other live markets (${dimmed.length})</div>`;
+    html += '<div class="cards">';
+    for (const r of dimmed) html += renderCard(r, true);
+    html += '</div>';
+  }
+
   area.innerHTML = html;
+}
+
+function renderCard(r, isDimmed) {
+  const dimCls = isDimmed ? ' card-dimmed' : '';
+
+  let badges = '';
+  if (r.qualified) badges += '<span class="card-badge badge-swing">SWING</span> ';
+  badges += '<span class="card-badge badge-live">LIVE</span>';
+
+  // Find the pre-match favourite (highest pre_match_price)
+  let favIdx = -1;
+  let maxPre = -1;
+  r.outcomes.forEach((o, i) => {
+    if (o.pre_match_price != null && o.pre_match_price > maxPre) {
+      maxPre = o.pre_match_price;
+      favIdx = i;
+    }
+  });
+
+  let html = `<div class="card${dimCls}">
+    <div class="card-top-row">
+      <span class="card-sport">${esc(r.sport)}</span>
+      <span>${badges}</span>
+    </div>
+    <div class="card-title">
+      <a href="${esc(r.polymarket_url)}" target="_blank" rel="noopener"
+         title="${esc(r.market_question)}">${esc(r.market_question || r.event_title)}</a>
+    </div>
+    <div class="card-meta">
+      <span>Vol $${fmtNum(r.volume)}</span>
+    </div>`;
+
+  if (isDimmed && r.disqualify_reason) {
+    html += `<div class="card-reason">${esc(r.disqualify_reason)}</div>`;
+  }
+
+  r.outcomes.forEach((o, i) => {
+    const cls = (o.change_cents != null && o.change_cents < 0) ? 'pct-neg'
+              : (o.change_cents != null && o.change_cents > 0) ? 'pct-pos' : 'pct-na';
+    const nameCls = (i === favIdx) ? 'outcome-name outcome-fav' : 'outcome-name';
+    html += `<div class="outcome-row">
+      <span class="${nameCls}" title="${esc(o.name)}">${esc(o.name)}</span>
+      <span class="price price-pre">${centsStr(o.pre_match_price)}</span>
+      <span class="arrow">\u2192</span>
+      <span class="price">${centsStr(o.current_price)}</span>
+      <span class="pct ${cls}">${changeStr(o.change_cents)}</span>
+    </div>`;
+  });
+
+  html += '</div>';
+  return html;
 }
 
 function esc(s) {
@@ -411,6 +526,7 @@ function esc(s) {
 }
 
 function fmtNum(n) {
+  if (n == null) return '?';
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(Math.round(n));
@@ -426,7 +542,7 @@ function startMonitor() {
   monitoring = true;
   $('btnMonitor').textContent = 'Stop Monitoring';
   $('btnMonitor').className = 'btn btn-stop';
-  setStatus('Starting…', 'dot-scan');
+  setStatus('Starting\u2026', 'dot-scan');
   doScan();
   scheduleNext();
 }
@@ -463,16 +579,18 @@ async function loadLog() {
     const resp = await fetch('/api/log');
     const data = await resp.json();
     const entries = data.entries || [];
-    $('logCount').textContent = entries.length;
+    $('logCount').textContent = data.total || entries.length;
 
     const tbody = $('logTableBody');
     tbody.innerHTML = '';
     for (const e of entries) {
+      const ts = e.timestamp || e.recorded_at || '';
+      const name = e.market_name || e.market_question || '';
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${esc(e.timestamp)}</td>
+        <td>${esc(ts)}</td>
         <td>${esc(e.sport)}</td>
-        <td>${esc(e.market_name)}</td>
+        <td>${esc(name)}</td>
         <td>${esc(e.outcome_1_name || '')}</td>
         <td>${centsStr(e.outcome_1_pre)}</td>
         <td>${centsStr(e.outcome_1_cur)}</td>

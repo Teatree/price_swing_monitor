@@ -14,13 +14,19 @@ _conn = None
 
 
 def _get_conn():
-    """Lazy-init a single persistent connection."""
+    """Lazy-init a single persistent connection with reconnect on failure."""
     global _conn
     if _conn is not None:
         try:
-            _conn.cursor().execute("SELECT 1")
+            cur = _conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
             return _conn
         except Exception:
+            try:
+                _conn.close()
+            except Exception:
+                pass
             _conn = None
 
     url = os.environ.get("DATABASE_URL")
@@ -28,8 +34,13 @@ def _get_conn():
         return None
 
     import psycopg2
-    _conn = psycopg2.connect(url, connect_timeout=5)
-    _conn.autocommit = True
+    try:
+        _conn = psycopg2.connect(url, connect_timeout=10)
+        _conn.autocommit = True
+        logger.info("PostgreSQL connection established")
+    except Exception as e:
+        logger.error("PostgreSQL connect failed: %s", e)
+        _conn = None
     return _conn
 
 
@@ -121,10 +132,10 @@ def insert_swing(result: dict) -> bool:
                 result.get("polymarket_url"),
                 result.get("volume"),
                 result.get("end_date"),
-                result.get("closed"),
-                _o(0, "name"), _o(0, "pre_end_price"), _o(0, "current_price"),
-                _o(1, "name"), _o(1, "pre_end_price"), _o(1, "current_price"),
-                _o(2, "name"), _o(2, "pre_end_price"), _o(2, "current_price"),
+                result.get("closed", False),
+                _o(0, "name"), _o(0, "pre_match_price"), _o(0, "current_price"),
+                _o(1, "name"), _o(1, "pre_match_price"), _o(1, "current_price"),
+                _o(2, "name"), _o(2, "pre_match_price"), _o(2, "current_price"),
             ))
         return True
     except Exception as e:
