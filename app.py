@@ -13,9 +13,15 @@ from threading import Lock
 import requests
 from flask import Flask, render_template, jsonify, request as req
 
+from db import init_db, insert_swing, get_all_swings, get_count
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Init DB on startup (no-op if DATABASE_URL not set)
+with app.app_context():
+    _db_available = init_db()
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -346,6 +352,11 @@ def _log_if_new(result: dict):
     cid = result.get("condition_id", "")
     if not cid:
         return
+
+    # Write to Postgres (upserts — safe to call repeatedly)
+    insert_swing(result)
+
+    # Also keep in-memory copy
     with _log_lock:
         if cid in seen_conditions:
             return
@@ -440,8 +451,31 @@ def api_debug():
 
 @app.route("/api/log")
 def api_log():
+    # Prefer Postgres, fall back to in-memory
+    if _db_available:
+        sport = req.args.get("sport")
+        limit = int(req.args.get("limit", 200))
+        rows = get_all_swings(limit=limit, sport=sport)
+        # Serialize datetimes
+        for r in rows:
+            for k, v in r.items():
+                if isinstance(v, datetime):
+                    r[k] = v.strftime("%Y-%m-%d %H:%M:%S UTC")
+        return jsonify({"entries": rows, "total": get_count(), "source": "postgres"})
     with _log_lock:
-        return jsonify({"entries": list(market_log)})
+        return jsonify({"entries": list(market_log), "total": len(market_log), "source": "memory"})
+
+
+@app.route("/api/db-test")
+def api_db_test():
+    """Quick check that Postgres is connected and working."""
+    if not _db_available:
+        return jsonify({"ok": False, "error": "DATABASE_URL not set"}), 503
+    try:
+        count = get_count()
+        return jsonify({"ok": True, "row_count": count})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
