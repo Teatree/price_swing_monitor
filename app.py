@@ -54,17 +54,20 @@ RESOLUTION_CHECK_INTERVAL = 120  # check unresolved markets every 2 minutes
 RESOLUTION_THRESHOLD = 0.95      # outcome price >= this = winner
 
 # ---------------------------------------------------------------------------
-# Sport → Polymarket series IDs (from /sports endpoint)
+# Sport → Polymarket identifiers
+# Each sport has either series_ids (queried individually) or a tag_id
+# (single query catches ALL leagues under that tag).
+# tag_id 100350 = all soccer, 64 = all esports
 # ---------------------------------------------------------------------------
-SPORT_SERIES = {
-    "CS2":      [10310],
-    "Dota2":    [10309],
-    "Valorant": [10369],
-    "LoL":      [10311],
-    "Soccer":   [10188, 10193, 10204, 10189, 10203, 10194, 10195],
-    "NFL":      [10187],
-    "NBA":      [10345],
-    "NHL":      [10346],
+SPORT_CONFIG = {
+    "CS2":      {"series": [10310]},
+    "Dota2":    {"series": [10309]},
+    "Valorant": {"series": [10369]},
+    "LoL":      {"series": [10311]},
+    "Soccer":   {"tag": 100350},       # covers all 55+ soccer leagues
+    "NFL":      {"series": [10187]},
+    "NBA":      {"series": [10345]},
+    "NHL":      {"series": [10346]},
 }
 
 # ---------------------------------------------------------------------------
@@ -108,12 +111,13 @@ def _parse_dt(s: str | None) -> datetime | None:
 # Gamma API
 # ---------------------------------------------------------------------------
 
-def fetch_active_events(series_id: int, limit: int = 50) -> list[dict]:
+def fetch_active_events(series_id: int = None, tag_id: int = None,
+                        limit: int = 50) -> list[dict]:
+    """Fetch active non-closed events by series_id or tag_id."""
     out = []
     offset = 0
     while offset < 500:
         params = {
-            "series_id": str(series_id),
             "active": "true",
             "closed": "false",
             "order": "endDate",
@@ -121,12 +125,17 @@ def fetch_active_events(series_id: int, limit: int = 50) -> list[dict]:
             "limit": limit,
             "offset": offset,
         }
+        if series_id:
+            params["series_id"] = str(series_id)
+        if tag_id:
+            params["tag_id"] = str(tag_id)
         try:
             r = requests.get(f"{GAMMA}/events", params=params, timeout=15)
             r.raise_for_status()
             batch = r.json()
         except Exception as e:
-            logger.warning("Gamma error series=%s: %s", series_id, e)
+            label = f"series={series_id}" if series_id else f"tag={tag_id}"
+            logger.warning("Gamma error %s: %s", label, e)
             break
         if not batch:
             break
@@ -291,26 +300,34 @@ def scan_markets(
     seen_cids: set[str] = set()
 
     for sport in sports:
-        series_ids = SPORT_SERIES.get(sport, [])
-        for sid in series_ids:
-            events = fetch_active_events(sid)
-            logger.info("  %s series=%s → %d active events", sport, sid, len(events))
-            mkt_count = 0
-            live_count = 0
-            for event in events:
-                for market in event.get("markets") or []:
-                    mkt_count += 1
-                    cid = market.get("conditionId", "")
-                    if cid in seen_cids:
-                        continue
-                    seen_cids.add(cid)
-                    r = _process_market(market, event, sport, now, now_unix,
-                                        min_volume, min_shares,
-                                        start_price_min, current_price_max)
-                    if r:
-                        live_count += 1
-                        results.append(r)
-            logger.info("    → %d markets checked, %d live", mkt_count, live_count)
+        cfg = SPORT_CONFIG.get(sport, {})
+        # Collect all events — either by tag (one call) or by series IDs
+        all_events = []
+        if "tag" in cfg:
+            all_events = fetch_active_events(tag_id=cfg["tag"])
+            logger.info("  %s tag=%s → %d active events", sport, cfg["tag"], len(all_events))
+        else:
+            for sid in cfg.get("series", []):
+                evts = fetch_active_events(series_id=sid)
+                logger.info("  %s series=%s → %d active events", sport, sid, len(evts))
+                all_events.extend(evts)
+
+        mkt_count = 0
+        live_count = 0
+        for event in all_events:
+            for market in event.get("markets") or []:
+                mkt_count += 1
+                cid = market.get("conditionId", "")
+                if cid in seen_cids:
+                    continue
+                seen_cids.add(cid)
+                r = _process_market(market, event, sport, now, now_unix,
+                                    min_volume, min_shares,
+                                    start_price_min, current_price_max)
+                if r:
+                    live_count += 1
+                    results.append(r)
+        logger.info("    → %d markets checked, %d live", mkt_count, live_count)
     logger.info("Scan complete: %d live markets", len(results))
     return results
 
@@ -621,7 +638,7 @@ def _monitor_loop(config: dict):
     """Runs in a background thread. Scans repeatedly until _monitor_stop is set."""
     global _last_results, _last_scan_at
 
-    sports = config.get("sports", list(SPORT_SERIES.keys()))
+    sports = config.get("sports", list(SPORT_CONFIG.keys()))
     min_volume = config.get("min_volume", 10000)
     min_shares = config.get("min_shares", 0)
     start_price_min = config.get("start_price_min", 0.68)
