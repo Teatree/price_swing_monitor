@@ -139,23 +139,44 @@ def fetch_active_events(series_id: int, limit: int = 50) -> list[dict]:
 # CLOB API helpers
 # ---------------------------------------------------------------------------
 
-def clob_price(token_id: str) -> float | None:
-    try:
-        r = requests.get(f"{CLOB}/price",
-                         params={"token_id": token_id, "side": "BUY"}, timeout=5)
-        return float(r.json().get("price", 0))
-    except Exception:
-        return None
+def clob_best_ask(token_id: str) -> tuple[float | None, float]:
+    """Get best ask price from the order book (most reliable price source).
 
-
-def clob_book_depth(token_id: str, levels: int = 5) -> float:
+    Returns (price, total_depth_shares).
+    Filters out stale asks >= 95c (known Polymarket /book bug).
+    Falls back to /price endpoint if /book fails.
+    """
     try:
         r = requests.get(f"{CLOB}/book",
                          params={"token_id": token_id}, timeout=5)
-        asks = r.json().get("asks", [])
-        return sum(float(a.get("size", 0)) for a in asks[:levels])
+        data = r.json()
+        asks = data.get("asks", [])
+        # Sort by price ascending, filter out stale >= 95c
+        valid = []
+        for a in asks:
+            p = float(a.get("price", 0))
+            s = float(a.get("size", 0))
+            if 0 < p < 0.95 and s > 0:
+                valid.append((p, s))
+        valid.sort(key=lambda x: x[0])
+        if valid:
+            best_price = valid[0][0]
+            total_depth = sum(s for _, s in valid[:5])
+            return best_price, total_depth
+    except Exception as e:
+        logger.debug("book error %s: %s", token_id, e)
+
+    # Fallback: /price endpoint
+    try:
+        r = requests.get(f"{CLOB}/price",
+                         params={"token_id": token_id, "side": "BUY"}, timeout=5)
+        p = float(r.json().get("price", 0))
+        if p > 0:
+            return p, 0.0
     except Exception:
-        return 0.0
+        pass
+
+    return None, 0.0
 
 
 def clob_price_history(token_id: str, now_unix: int) -> list[dict]:
@@ -340,10 +361,13 @@ def _process_market(market, event, sport, now, now_unix,
     if not is_live:
         return None
 
-    # --- Now fetch real best-ask prices from CLOB (only for live markets) ---
+    # --- Now fetch real best-ask prices from order book (only for live markets) ---
     current: list[float | None] = []
+    depths: list[float] = []
     for tok in tokens:
-        current.append(clob_price(tok))
+        price, depth = clob_best_ask(tok)
+        current.append(price)
+        depths.append(depth)
         time.sleep(DELAY)
 
     # Re-check with real prices: skip if any outcome >= 99c
@@ -384,6 +408,7 @@ def _process_market(market, event, sport, now, now_unix,
             "current_price": cur,
             "pre_match_price": pre,
             "change_cents": change,
+            "shares_available": depths[i] if i < len(depths) else 0,
         })
 
     # --- Soft filters (swing criteria — flag but don't discard) ---
@@ -409,15 +434,12 @@ def _process_market(market, event, sport, now, now_unix,
             qualified = False
             disqualify_reason = f"Fav now {fav_cur*100:.0f}\u00a2 \u2265 {cur_max*100:.0f}\u00a2 threshold"
 
-    # Depth filter only for qualified
+    # Depth filter (depth already fetched from book)
     if qualified and min_shares > 0:
         for o in outcome_data:
-            d = clob_book_depth(o["token_id"])
-            o["shares_available"] = d
-            time.sleep(DELAY)
-            if d < min_shares:
+            if o["shares_available"] < min_shares:
                 qualified = False
-                disqualify_reason = f"Insufficient depth ({d:.0f} < {min_shares:.0f} shares)"
+                disqualify_reason = f"Insufficient depth ({o['shares_available']:.0f} < {min_shares:.0f} shares)"
                 break
 
     # --- Build result ---
