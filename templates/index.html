@@ -328,12 +328,12 @@
 </div>
 
 <script>
-let monitoring = false;
-let timer = null;
+let monitoring = false;   // true when server-side monitor is running
+let pollTimer = null;     // polls /api/monitor/status for fresh results
 let scanning = false;
 let soundEnabled = true;
 let telegramEnabled = false;
-let knownSwingIds = new Set();  // condition_ids of swing markets we've already seen
+let knownSwingIds = new Set();
 
 function $(id) { return document.getElementById(id); }
 
@@ -445,9 +445,9 @@ function setLoading(on) {
   $('loadingBar').classList.toggle('hidden', !on);
 }
 
-// ── Scan ──
+// ── One-shot scan (only when monitor is OFF) ──
 async function doScan() {
-  if (scanning) return;
+  if (scanning || monitoring) return;
   scanning = true;
   setLoading(true);
   setStatus('Scanning\u2026', 'dot-scan');
@@ -460,31 +460,7 @@ async function doScan() {
     const resp = await fetch('/api/scan?' + qs);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
-
-    // Check for new swing markets (sound only fires on NEW ones)
-    const allQualified = (data.results || []).filter(r => r.qualified);
-    const newSwings = allQualified.filter(r => !knownSwingIds.has(r.condition_id));
-    if (newSwings.length > 0) {
-      playSwingAlert();
-      for (const r of newSwings) knownSwingIds.add(r.condition_id);
-    }
-
-    // Telegram: send ALL qualified markets on every scan (with updated prices)
-    if (allQualified.length > 0) {
-      sendTelegram(allQualified);
-    }
-
-    renderResults(data);
-    const elapsed = data.elapsed_s ? ` \u00b7 ${data.elapsed_s}s` : '';
-    const q = data.count_qualified || 0;
-    const t = data.count_total || 0;
-    setStatus(
-      monitoring
-        ? `Live \u00b7 ${q} swings / ${t} markets${elapsed} \u00b7 next in ${$('interval').value}s`
-        : `${q} swings / ${t} live markets${elapsed} \u00b7 ${new Date().toLocaleTimeString()}`,
-      monitoring ? 'dot-live' : 'dot-idle'
-    );
-    loadLog();
+    handleScanData(data);
   } catch (e) {
     console.error(e);
     setStatus('Error: ' + e.message, 'dot-error');
@@ -493,6 +469,29 @@ async function doScan() {
     setLoading(false);
     $('btnScan').disabled = false;
   }
+}
+
+function handleScanData(data) {
+  // Check for new swing markets (sound fires on NEW ones)
+  const allQualified = (data.results || []).filter(r => r.qualified);
+  const newSwings = allQualified.filter(r => !knownSwingIds.has(r.condition_id));
+  if (newSwings.length > 0) {
+    playSwingAlert();
+    for (const r of newSwings) knownSwingIds.add(r.condition_id);
+  }
+
+  renderResults(data);
+  const elapsed = data.elapsed_s ? ` \u00b7 ${data.elapsed_s}s` : '';
+  const q = data.count_qualified || 0;
+  const t = data.count_total || 0;
+  const scanTime = data.scanned_at ? new Date(data.scanned_at).toLocaleTimeString() : '';
+  setStatus(
+    monitoring
+      ? `Live \u00b7 ${q} swings / ${t} markets${elapsed} \u00b7 last scan ${scanTime}`
+      : `${q} swings / ${t} live markets${elapsed} \u00b7 ${scanTime}`,
+    monitoring ? 'dot-live' : 'dot-idle'
+  );
+  loadLog();
 }
 
 // ── Render ──
@@ -603,38 +602,144 @@ function fmtNum(n) {
   return String(Math.round(n));
 }
 
-// ── Monitor ──
+// ── Server-side monitor ──
 function toggleMonitor() {
   if (monitoring) stopMonitor();
   else startMonitor();
 }
 
-function startMonitor() {
+async function startMonitor() {
+  setStatus('Starting server monitor\u2026', 'dot-scan');
+  $('btnMonitor').disabled = true;
+
+  const params = getParams();
+  try {
+    const resp = await fetch('/api/monitor/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        sports:            params.sports,
+        min_volume:        params.min_volume,
+        min_shares:        params.min_shares,
+        start_price_min:   params.start_price_min,
+        current_price_max: params.current_price_max,
+        interval:          $('interval').value,
+        telegram:          telegramEnabled,
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      enterMonitoringUI();
+      startPolling();
+    } else {
+      setStatus('Failed to start: ' + (data.error || ''), 'dot-error');
+    }
+  } catch (e) {
+    setStatus('Error: ' + e.message, 'dot-error');
+  }
+  $('btnMonitor').disabled = false;
+}
+
+async function stopMonitor() {
+  setStatus('Stopping\u2026', 'dot-scan');
+  $('btnMonitor').disabled = true;
+  try {
+    await fetch('/api/monitor/stop', {method: 'POST'});
+  } catch (e) { /* best effort */ }
+  stopPolling();
+  exitMonitoringUI();
+  $('btnMonitor').disabled = false;
+}
+
+function enterMonitoringUI() {
   monitoring = true;
   $('btnMonitor').textContent = 'Stop Monitoring';
   $('btnMonitor').className = 'btn btn-stop';
-  setStatus('Starting\u2026', 'dot-scan');
-  doScan();
-  scheduleNext();
+  $('btnScan').disabled = true;
+  // Lock controls while monitoring
+  document.querySelectorAll('.controls input').forEach(el => el.disabled = true);
+  document.querySelectorAll('.sport-check input').forEach(el => el.disabled = true);
 }
 
-function stopMonitor() {
+function exitMonitoringUI() {
   monitoring = false;
-  clearTimeout(timer);
-  timer = null;
   $('btnMonitor').textContent = 'Start Monitoring';
   $('btnMonitor').className = 'btn btn-start';
+  $('btnScan').disabled = false;
   setStatus('Stopped', 'dot-idle');
+  // Unlock controls
+  document.querySelectorAll('.controls input').forEach(el => el.disabled = false);
+  document.querySelectorAll('.sport-check input').forEach(el => el.disabled = false);
 }
 
-function scheduleNext() {
-  if (!monitoring) return;
-  const secs = Math.max(15, parseInt($('interval').value) || 60);
-  timer = setTimeout(() => {
-    if (!monitoring) return;
-    doScan().then(() => scheduleNext());
-  }, secs * 1000);
+function startPolling() {
+  stopPolling();
+  pollForResults();  // immediate first poll
+  pollTimer = setInterval(pollForResults, 10000);  // poll every 10s
 }
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function pollForResults() {
+  try {
+    const resp = await fetch('/api/monitor/status');
+    const data = await resp.json();
+    if (!data.running) {
+      // Server stopped (maybe crashed/restarted) — sync UI
+      stopPolling();
+      exitMonitoringUI();
+      return;
+    }
+    if (data.results) {
+      handleScanData(data.results);
+    }
+  } catch (e) {
+    console.error('Poll error:', e);
+  }
+}
+
+// ── On page load: sync with server state ──
+async function syncState() {
+  try {
+    const resp = await fetch('/api/monitor/status');
+    const data = await resp.json();
+    if (data.running) {
+      // Server is monitoring — restore UI
+      if (data.config) {
+        // Restore control values from server config
+        $('minVolume').value = data.config.min_volume || 10000;
+        $('minShares').value = data.config.min_shares || 0;
+        $('interval').value = data.config.interval || 60;
+        $('startPrice').value = Math.round((data.config.start_price_min || 0.68) * 100);
+        $('curPrice').value = Math.round((data.config.current_price_max || 0.40) * 100);
+        // Restore sport checkboxes
+        if (data.config.sports) {
+          const active = new Set(data.config.sports);
+          document.querySelectorAll('.sport-check input').forEach(el => {
+            el.checked = active.has(el.value);
+          });
+        }
+        // Restore telegram toggle
+        if (data.config.telegram) {
+          telegramEnabled = true;
+          $('tgToggle').classList.add('on');
+          $('tgLabel').textContent = 'TG ON';
+        }
+      }
+      enterMonitoringUI();
+      startPolling();
+      // Show cached results immediately
+      if (data.results) handleScanData(data.results);
+    }
+  } catch (e) {
+    console.error('State sync error:', e);
+  }
+}
+
+// Run on page load
+syncState();
 
 // ── Log ──
 let logOpen = false;

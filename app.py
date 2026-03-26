@@ -16,7 +16,7 @@ import json
 import time
 import logging
 from datetime import datetime, timedelta, timezone
-from threading import Lock
+from threading import Lock, Thread, Event
 from statistics import median
 
 import requests
@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 
 with app.app_context():
     _db_available = init_db()
+
+# ---------------------------------------------------------------------------
+# Server-side monitor state (survives browser tab close)
+# ---------------------------------------------------------------------------
+_monitor_lock = Lock()
+_monitor_stop = Event()       # set() to signal the bg thread to stop
+_monitor_thread: Thread | None = None
+_monitor_config: dict = {}    # params the monitor was started with
+_monitor_started_at: str = ""
+_last_results: dict = {}      # cached results from most recent scan
+_last_scan_at: str = ""
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -464,6 +475,74 @@ def _log_if_new(result: dict):
             seen_conditions.clear()
 
 # ---------------------------------------------------------------------------
+# Background monitor loop
+# ---------------------------------------------------------------------------
+
+def _monitor_loop(config: dict):
+    """Runs in a background thread. Scans repeatedly until _monitor_stop is set."""
+    global _last_results, _last_scan_at
+
+    sports = config.get("sports", list(SPORT_SERIES.keys()))
+    min_volume = config.get("min_volume", 10000)
+    min_shares = config.get("min_shares", 0)
+    start_price_min = config.get("start_price_min", 0.68)
+    current_price_max = config.get("current_price_max", 0.40)
+    interval = max(15, config.get("interval", 60))
+    send_tg = config.get("telegram", False)
+
+    logger.info("Monitor started: interval=%ds sports=%s tg=%s", interval, sports, send_tg)
+
+    while not _monitor_stop.is_set():
+        try:
+            t0 = time.time()
+            results = scan_markets(sports, min_volume, min_shares,
+                                   start_price_min, current_price_max)
+            elapsed = round(time.time() - t0, 1)
+
+            qualified = [r for r in results if r.get("qualified")]
+            dimmed = [r for r in results if not r.get("qualified")]
+
+            qualified.sort(key=lambda r: min(
+                (o["change_cents"] for o in r["outcomes"] if o["change_cents"] is not None),
+                default=0,
+            ))
+            dimmed.sort(key=lambda r: r.get("volume", 0), reverse=True)
+
+            scan_data = {
+                "results": qualified + dimmed,
+                "count_qualified": len(qualified),
+                "count_total": len(results),
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_s": elapsed,
+            }
+
+            with _monitor_lock:
+                _last_results = scan_data
+                _last_scan_at = scan_data["scanned_at"]
+
+            # Telegram: send if enabled and there are qualified markets
+            if send_tg and qualified:
+                try:
+                    text = _format_telegram_message(qualified)
+                    send_telegram(text)
+                except Exception as e:
+                    logger.error("Monitor TG send error: %s", e)
+
+            logger.info("Monitor scan done: %d qualified, %d total, %.1fs",
+                        len(qualified), len(results), elapsed)
+        except Exception as e:
+            logger.error("Monitor scan error: %s", e)
+
+        # Sleep in small increments so we can stop quickly
+        for _ in range(interval):
+            if _monitor_stop.is_set():
+                break
+            time.sleep(1)
+
+    logger.info("Monitor stopped")
+
+
+# ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
 
@@ -474,6 +553,7 @@ def index():
 
 @app.route("/api/scan")
 def api_scan():
+    """One-shot scan (used by Scan Now button when monitor is off)."""
     sports = [s for s in req.args.get("sports", "CS2,Dota2,Valorant,LoL,Soccer,NFL,NBA,NHL").split(",") if s]
     min_volume      = float(req.args.get("min_volume", 10000))
     min_shares      = float(req.args.get("min_shares", 0))
@@ -488,12 +568,10 @@ def api_scan():
     qualified = [r for r in results if r.get("qualified")]
     dimmed    = [r for r in results if not r.get("qualified")]
 
-    # Qualified: biggest absolute swing first
     qualified.sort(key=lambda r: min(
         (o["change_cents"] for o in r["outcomes"] if o["change_cents"] is not None),
         default=0,
     ))
-    # Dimmed: by volume (most liquid first)
     dimmed.sort(key=lambda r: r.get("volume", 0), reverse=True)
 
     return jsonify({
@@ -503,6 +581,74 @@ def api_scan():
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_s": elapsed,
     })
+
+
+@app.route("/api/monitor/start", methods=["POST"])
+def api_monitor_start():
+    """Start server-side background monitoring."""
+    global _monitor_thread, _monitor_config, _monitor_started_at
+
+    with _monitor_lock:
+        if _monitor_thread and _monitor_thread.is_alive():
+            return jsonify({"ok": True, "status": "already_running"})
+
+    data = req.get_json(silent=True) or {}
+    config = {
+        "sports": [s for s in data.get("sports", "CS2,Dota2,Valorant,LoL,Soccer,NFL,NBA,NHL").split(",") if s],
+        "min_volume": float(data.get("min_volume", 10000)),
+        "min_shares": float(data.get("min_shares", 0)),
+        "start_price_min": float(data.get("start_price_min", 68)) / 100,
+        "current_price_max": float(data.get("current_price_max", 40)) / 100,
+        "interval": int(data.get("interval", 60)),
+        "telegram": bool(data.get("telegram", False)),
+    }
+
+    _monitor_stop.clear()
+    _monitor_config = config
+    _monitor_started_at = datetime.now(timezone.utc).isoformat()
+    _monitor_thread = Thread(target=_monitor_loop, args=(config,), daemon=True)
+    _monitor_thread.start()
+
+    return jsonify({"ok": True, "status": "started", "config": config})
+
+
+@app.route("/api/monitor/stop", methods=["POST"])
+def api_monitor_stop():
+    """Stop server-side background monitoring."""
+    global _monitor_thread
+    _monitor_stop.set()
+    if _monitor_thread:
+        _monitor_thread.join(timeout=5)
+        _monitor_thread = None
+    return jsonify({"ok": True, "status": "stopped"})
+
+
+@app.route("/api/monitor/status")
+def api_monitor_status():
+    """Check if server-side monitor is running + get latest cached results."""
+    running = _monitor_thread is not None and _monitor_thread.is_alive()
+    with _monitor_lock:
+        return jsonify({
+            "running": running,
+            "config": _monitor_config if running else None,
+            "started_at": _monitor_started_at if running else None,
+            "last_scan_at": _last_scan_at,
+            "results": _last_results if _last_results else None,
+        })
+
+
+@app.route("/api/monitor/reset", methods=["POST", "GET"])
+def api_monitor_reset():
+    """Force-stop monitoring. GET allowed so you can just hit the URL in a browser."""
+    global _monitor_thread, _last_results, _last_scan_at
+    _monitor_stop.set()
+    if _monitor_thread:
+        _monitor_thread.join(timeout=5)
+        _monitor_thread = None
+    with _monitor_lock:
+        _last_results = {}
+        _last_scan_at = ""
+    return jsonify({"ok": True, "status": "reset"})
 
 
 @app.route("/api/log")
