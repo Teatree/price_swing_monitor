@@ -22,7 +22,7 @@ from statistics import median
 import requests
 from flask import Flask, render_template, jsonify, request as req
 
-from db import init_db, insert_swing, get_all_swings, get_count
+from db import init_db, insert_swing, get_all_swings, get_count, get_unresolved, mark_resolved
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +50,8 @@ DELAY = 0.15
 STABLE_BAND_CENTS = 2      # max ±2c variation to count as "stable"
 STABLE_MIN_POINTS = 6      # minimum 6 data points (~30 min at 5-min fidelity)
 BREAKOUT_CENTS = 5          # current price must be >=5c away from stable price
+RESOLUTION_CHECK_INTERVAL = 120  # check unresolved markets every 2 minutes
+RESOLUTION_THRESHOLD = 0.95      # outcome price >= this = winner
 
 # ---------------------------------------------------------------------------
 # Sport → Polymarket series IDs (from /sports endpoint)
@@ -495,6 +497,121 @@ def _log_if_new(result: dict):
         # Cap seen set (old entries don't matter — DB handles dedup)
         if len(seen_conditions) > 2000:
             seen_conditions.clear()
+
+# ---------------------------------------------------------------------------
+# Resolution tracker (runs always in background, independent of monitor)
+# ---------------------------------------------------------------------------
+
+def _resolution_loop():
+    """Check unresolved swing markets and mark them when a winner is clear."""
+    logger.info("Resolution tracker started (every %ds)", RESOLUTION_CHECK_INTERVAL)
+    while True:
+        try:
+            unresolved = get_unresolved()
+            if unresolved:
+                logger.info("Resolution check: %d unresolved markets", len(unresolved))
+
+            for mkt in unresolved:
+                cid = mkt["condition_id"]
+                prices = _check_resolution_prices(cid)
+                if not prices:
+                    continue
+
+                # Attach pre-match prices from the DB row
+                db_pres = {}
+                for i in range(1, 4):
+                    n = mkt.get(f"outcome_{i}_name")
+                    p = mkt.get(f"outcome_{i}_pre")
+                    if n:
+                        db_pres[n] = p
+                prices = [(name, cur, db_pres.get(name)) for name, cur, _ in prices]
+
+                # Check if any outcome hit the threshold
+                winner = None
+                for name, cur_price, pre_price in prices:
+                    if cur_price >= RESOLUTION_THRESHOLD:
+                        winner = (name, cur_price, pre_price)
+                        break
+
+                if winner:
+                    w_name, w_final, w_pre = winner
+                    # Find the loser (highest pre-price that isn't the winner)
+                    losers = [(n, cp, pp) for n, cp, pp in prices if n != w_name]
+                    if losers:
+                        # Pick the one with highest pre-match price as "the loser"
+                        loser = max(losers, key=lambda x: x[2] or 0)
+                        l_name, l_final, l_pre = loser
+                    else:
+                        l_name, l_final, l_pre = None, None, None
+
+                    # Did the pre-match favorite win?
+                    all_pres = [(n, pp) for n, _, pp in prices if pp is not None]
+                    fav_name = max(all_pres, key=lambda x: x[1])[0] if all_pres else None
+                    fav_won = (w_name == fav_name) if fav_name else None
+
+                    mark_resolved(cid, w_name, w_pre, w_final,
+                                  l_name, l_pre, l_final, fav_won)
+                    logger.info("Resolved: %s → winner=%s (fav_won=%s)",
+                                mkt.get("market_question", cid), w_name, fav_won)
+
+                time.sleep(DELAY)
+
+        except Exception as e:
+            logger.error("Resolution loop error: %s", e)
+
+        time.sleep(RESOLUTION_CHECK_INTERVAL)
+
+
+def _check_resolution_prices(condition_id: str):
+    """Fetch current prices for a market by condition_id.
+    Returns list of (outcome_name, current_price, pre_price) or None."""
+    try:
+        # Look up the market from Gamma to get token IDs
+        r = requests.get(f"{GAMMA}/markets",
+                         params={"condition_id": condition_id}, timeout=10)
+        if r.status_code != 200:
+            return None
+        markets = r.json()
+        if not markets:
+            return None
+        mkt = markets[0] if isinstance(markets, list) else markets
+
+        outcomes = _parse(mkt.get("outcomes"))
+        tokens = _parse(mkt.get("clobTokenIds"))
+        if not outcomes or not tokens:
+            return None
+
+        # If market is already closed on Gamma, use outcomePrices (resolved = 0/1)
+        if mkt.get("closed"):
+            gamma_prices = _parse(mkt.get("outcomePrices"))
+            if gamma_prices and len(gamma_prices) == len(outcomes):
+                return [(name, float(gamma_prices[i]), None)
+                        for i, name in enumerate(outcomes)]
+
+        # Market still open — get live prices from book
+        result = []
+        for i, (name, tok) in enumerate(zip(outcomes, tokens)):
+            price, _ = clob_best_ask(tok)
+            result.append((name, price or 0, None))
+            time.sleep(DELAY)
+        return result
+
+    except Exception as e:
+        logger.debug("Resolution price check error %s: %s", condition_id, e)
+        return None
+
+
+def _start_resolution_tracker():
+    """Start the resolution tracker as a daemon thread."""
+    t = Thread(target=_resolution_loop, daemon=True, name="resolution-tracker")
+    t.start()
+    logger.info("Resolution tracker thread launched")
+
+
+# Start resolution tracker on import (runs regardless of monitor state)
+if os.environ.get("DATABASE_URL"):
+    _start_resolution_tracker()
+
 
 # ---------------------------------------------------------------------------
 # Background monitor loop

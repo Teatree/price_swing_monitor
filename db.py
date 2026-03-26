@@ -72,10 +72,38 @@ def init_db():
                 outcome_2_cur   REAL,
                 outcome_3_name  TEXT,
                 outcome_3_pre   REAL,
-                outcome_3_cur   REAL
+                outcome_3_cur   REAL,
+                -- Resolution tracking
+                resolved        BOOLEAN NOT NULL DEFAULT FALSE,
+                resolved_at     TIMESTAMPTZ,
+                winner_name     TEXT,
+                winner_pre      REAL,
+                winner_final    REAL,
+                loser_name      TEXT,
+                loser_pre       REAL,
+                loser_final     REAL,
+                fav_won         BOOLEAN  -- did the pre-match favorite win?
             );
         """)
-        # Index for common queries
+        # Add resolution columns if table already exists (migration)
+        for col, typ in [
+            ("resolved", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("resolved_at", "TIMESTAMPTZ"),
+            ("winner_name", "TEXT"),
+            ("winner_pre", "REAL"),
+            ("winner_final", "REAL"),
+            ("loser_name", "TEXT"),
+            ("loser_pre", "REAL"),
+            ("loser_final", "REAL"),
+            ("fav_won", "BOOLEAN"),
+        ]:
+            cur.execute(f"""
+                DO $$ BEGIN
+                    ALTER TABLE price_swings ADD COLUMN {col} {typ};
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+        # Indexes
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_ps_sport      ON price_swings (sport);
         """)
@@ -85,6 +113,10 @@ def init_db():
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_ps_condition
                 ON price_swings (condition_id);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ps_unresolved
+                ON price_swings (resolved) WHERE resolved = FALSE;
         """)
     logger.info("PostgreSQL connected — price_swings table ready")
     return True
@@ -163,7 +195,10 @@ def get_all_swings(limit: int = 200, sport: str | None = None) -> list[dict]:
                        market_closed,
                        outcome_1_name, outcome_1_pre, outcome_1_cur,
                        outcome_2_name, outcome_2_pre, outcome_2_cur,
-                       outcome_3_name, outcome_3_pre, outcome_3_cur
+                       outcome_3_name, outcome_3_pre, outcome_3_cur,
+                       resolved, resolved_at, winner_name, winner_pre,
+                       winner_final, loser_name, loser_pre, loser_final,
+                       fav_won
                 FROM price_swings
                 {where}
                 ORDER BY recorded_at DESC
@@ -174,6 +209,60 @@ def get_all_swings(limit: int = 200, sport: str | None = None) -> list[dict]:
     except Exception as e:
         logger.error("DB query error: %s", e)
         return []
+
+
+def get_unresolved() -> list[dict]:
+    """Fetch all swing markets that haven't resolved yet."""
+    conn = _get_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, condition_id, sport, market_question,
+                       outcome_1_name, outcome_1_pre,
+                       outcome_2_name, outcome_2_pre,
+                       outcome_3_name, outcome_3_pre,
+                       recorded_at
+                FROM price_swings
+                WHERE resolved = FALSE
+                ORDER BY recorded_at DESC
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        logger.error("DB get_unresolved error: %s", e)
+        return []
+
+
+def mark_resolved(condition_id: str, winner_name: str, winner_pre: float,
+                  winner_final: float, loser_name: str, loser_pre: float,
+                  loser_final: float, fav_won: bool) -> bool:
+    """Mark a swing market as resolved with the final outcome."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE price_swings SET
+                    resolved    = TRUE,
+                    resolved_at = NOW(),
+                    winner_name = %s,
+                    winner_pre  = %s,
+                    winner_final= %s,
+                    loser_name  = %s,
+                    loser_pre   = %s,
+                    loser_final = %s,
+                    fav_won     = %s
+                WHERE condition_id = %s AND resolved = FALSE
+            """, (winner_name, winner_pre, winner_final,
+                  loser_name, loser_pre, loser_final,
+                  fav_won, condition_id))
+        return True
+    except Exception as e:
+        logger.error("DB mark_resolved error: %s", e)
+        return False
 
 
 def get_count() -> int:
