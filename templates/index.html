@@ -461,16 +461,17 @@ async function doScan() {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
 
-    // Check for new swing markets
-    const newSwings = (data.results || []).filter(r =>
-      r.qualified && !knownSwingIds.has(r.condition_id)
-    );
+    // Check for new swing markets (sound only fires on NEW ones)
+    const allQualified = (data.results || []).filter(r => r.qualified);
+    const newSwings = allQualified.filter(r => !knownSwingIds.has(r.condition_id));
     if (newSwings.length > 0) {
       playSwingAlert();
-      // Send ALL current qualified markets (not just new ones) via Telegram
-      const allQualified = (data.results || []).filter(r => r.qualified);
-      sendTelegram(allQualified);
       for (const r of newSwings) knownSwingIds.add(r.condition_id);
+    }
+
+    // Telegram: send ALL qualified markets on every scan (with updated prices)
+    if (allQualified.length > 0) {
+      sendTelegram(allQualified);
     }
 
     renderResults(data);
