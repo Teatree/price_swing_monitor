@@ -687,7 +687,8 @@ def _monitor_loop(config: dict):
             logger.info("Monitor scan done: %d qualified, %d total, %.1fs",
                         len(qualified), len(results), elapsed)
         except Exception as e:
-            logger.error("Monitor scan error: %s", e)
+            import traceback
+            logger.error("Monitor scan error: %s\n%s", e, traceback.format_exc())
 
         # Sleep in small increments so we can stop quickly
         for _ in range(interval):
