@@ -64,7 +64,61 @@ SPORT_CONFIG = {
     "Dota2":    {"series": [10309]},
     "Valorant": {"series": [10369]},
     "LoL":      {"series": [10311]},
-    "Soccer":   {"tag": 100350},       # covers all 55+ soccer leagues
+    "Soccer":   {"series": [
+        10188,  # EPL
+        10193,  # La Liga
+        10194,  # Bundesliga
+        10195,  # Ligue 1
+        10203,  # Serie A
+        10204,  # UCL
+        10209,  # UEL
+        10189,  # MLS
+        10238,  # FIFA Friendlies
+        10243,  # UEFA Qualifiers
+        10241,  # AFC
+        10244,  # CONMEBOL
+        10246,  # CONCACAF
+        10240,  # CAF
+        10230,  # EFL
+        10286,  # Eredivisie
+        10285,  # Argentina
+        10287,  # Italian Cup
+        10288,  # Liga Colombia (LCS)
+        10289,  # Libertadores
+        10290,  # Liga MX
+        10291,  # Sudamericana
+        10292,  # Turkish League
+        10294,  # OFC
+        10306,  # Russian League
+        10307,  # EFA
+        10315,  # Copa del Rey (CDE)
+        10316,  # Copa del Rey (CDR)
+        10317,  # DFB Pokal
+        10330,  # Primeira Liga
+        10359,  # Brasileirao
+        10360,  # J-League
+        10361,  # Saudi Pro League
+        10362,  # Norwegian League
+        10363,  # Danish League
+        10364,  # Indian League
+        10437,  # Colombian League
+        10438,  # A-League
+        10439,  # Chilean League
+        10443,  # J2 League
+        10444,  # K-League
+        10863,  # SSC
+        10964,  # Colombian Liga 1
+        10965,  # Chilean Primera
+        10966,  # Bolivian Liga
+        10967,  # Peruvian Liga
+        10968,  # Moroccan Liga
+        10969,  # Egyptian Liga
+        10970,  # Czech Liga
+        10971,  # Romanian Liga
+        10973,  # Brasileirao Serie B
+        11240,  # UWCL
+        11241,  # Ukrainian Liga
+    ]},
     "NFL":      {"series": [10187]},
     "NBA":      {"series": [10345]},
     "NHL":      {"series": [10346]},
@@ -111,31 +165,27 @@ def _parse_dt(s: str | None) -> datetime | None:
 # Gamma API
 # ---------------------------------------------------------------------------
 
-def fetch_active_events(series_id: int = None, tag_id: int = None,
-                        limit: int = 50) -> list[dict]:
-    """Fetch active non-closed events by series_id or tag_id."""
+def fetch_active_events(series_id: int, limit: int = 100,
+                        max_events: int = 500) -> list[dict]:
+    """Fetch active non-closed events for a series."""
     out = []
     offset = 0
-    while offset < 500:
+    while offset < max_events:
         params = {
+            "series_id": str(series_id),
             "active": "true",
             "closed": "false",
-            "order": "endDate",
+            "order": "startDate",
             "ascending": "false",
             "limit": limit,
             "offset": offset,
         }
-        if series_id:
-            params["series_id"] = str(series_id)
-        if tag_id:
-            params["tag_id"] = str(tag_id)
         try:
             r = requests.get(f"{GAMMA}/events", params=params, timeout=15)
             r.raise_for_status()
             batch = r.json()
         except Exception as e:
-            label = f"series={series_id}" if series_id else f"tag={tag_id}"
-            logger.warning("Gamma error %s: %s", label, e)
+            logger.warning("Gamma error series=%s: %s", series_id, e)
             break
         if not batch:
             break
@@ -303,14 +353,10 @@ def scan_markets(
         cfg = SPORT_CONFIG.get(sport, {})
         # Collect all events — either by tag (one call) or by series IDs
         all_events = []
-        if "tag" in cfg:
-            all_events = fetch_active_events(tag_id=cfg["tag"])
-            logger.info("  %s tag=%s → %d active events", sport, cfg["tag"], len(all_events))
-        else:
-            for sid in cfg.get("series", []):
-                evts = fetch_active_events(series_id=sid)
-                logger.info("  %s series=%s → %d active events", sport, sid, len(evts))
-                all_events.extend(evts)
+        for sid in cfg.get("series", []):
+            evts = fetch_active_events(series_id=sid)
+            all_events.extend(evts)
+        logger.info("  %s → %d series, %d active events", sport, len(cfg.get("series", [])), len(all_events))
 
         mkt_count = 0
         live_count = 0
