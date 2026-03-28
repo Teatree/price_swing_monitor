@@ -75,49 +75,15 @@ SPORT_CONFIG = {
         10189,  # MLS
         10238,  # FIFA Friendlies
         10243,  # UEFA Qualifiers
-        10241,  # AFC
-        10244,  # CONMEBOL
         10246,  # CONCACAF
-        10240,  # CAF
-        10230,  # EFL
         10286,  # Eredivisie
-        10285,  # Argentina
-        10287,  # Italian Cup
-        10288,  # Liga Colombia (LCS)
         10289,  # Libertadores
         10290,  # Liga MX
-        10291,  # Sudamericana
         10292,  # Turkish League
-        10294,  # OFC
-        10306,  # Russian League
-        10307,  # EFA
-        10315,  # Copa del Rey (CDE)
-        10316,  # Copa del Rey (CDR)
-        10317,  # DFB Pokal
         10330,  # Primeira Liga
         10359,  # Brasileirao
-        10360,  # J-League
         10361,  # Saudi Pro League
-        10362,  # Norwegian League
-        10363,  # Danish League
-        10364,  # Indian League
-        10437,  # Colombian League
-        10438,  # A-League
-        10439,  # Chilean League
-        10443,  # J2 League
         10444,  # K-League
-        10863,  # SSC
-        10964,  # Colombian Liga 1
-        10965,  # Chilean Primera
-        10966,  # Bolivian Liga
-        10967,  # Peruvian Liga
-        10968,  # Moroccan Liga
-        10969,  # Egyptian Liga
-        10970,  # Czech Liga
-        10971,  # Romanian Liga
-        10973,  # Brasileirao Serie B
-        11240,  # UWCL
-        11241,  # Ukrainian Liga
     ]},
     "NFL":      {"series": [10187]},
     "NBA":      {"series": [10345]},
