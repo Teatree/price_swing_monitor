@@ -532,7 +532,7 @@ def _log_if_new(result: dict):
 # ---------------------------------------------------------------------------
 # Resolution checker (called from monitor loop, not a separate thread)
 # ---------------------------------------------------------------------------
-RESOLVE_BATCH_SIZE = 3  # check at most 3 unresolved markets per scan cycle
+RESOLVE_BATCH_SIZE = 5  # check at most 5 unresolved markets per scan cycle
 
 def check_resolutions(send_tg: bool = False):
     """Check a batch of unresolved swing markets. Called after each monitor scan.
@@ -548,7 +548,7 @@ def check_resolutions(send_tg: bool = False):
 
         for mkt in batch:
             cid = mkt["condition_id"]
-            prices = _check_resolution_prices(cid)
+            prices = _check_resolution_prices(mkt)
             if not prices:
                 continue
 
@@ -600,34 +600,43 @@ def check_resolutions(send_tg: bool = False):
         logger.error("Resolution check error: %s", e)
 
 
-def _check_resolution_prices(condition_id: str):
-    """Fetch current prices for a market by condition_id.
-    Uses Gamma outcomePrices (free) first, falls back to CLOB book."""
+def _check_resolution_prices(db_row: dict):
+    """Check if a market is resolved by looking up the event via slug.
+    Returns list of (outcome_name, current_price, None) or None."""
     try:
-        r = requests.get(f"{GAMMA}/markets",
-                         params={"condition_id": condition_id}, timeout=10)
+        # Extract slug from polymarket_url
+        url = db_row.get("polymarket_url") or ""
+        slug = url.split("/event/")[-1] if "/event/" in url else ""
+        condition_id = db_row.get("condition_id", "")
+        if not slug:
+            return None
+
+        r = requests.get(f"{GAMMA}/events",
+                         params={"slug": slug}, timeout=10)
         if r.status_code != 200:
             return None
-        markets = r.json()
-        if not markets:
+        events = r.json()
+        if not events:
             return None
-        mkt = markets[0] if isinstance(markets, list) else markets
+        event = events[0]
 
-        outcomes = _parse(mkt.get("outcomes"))
-        tokens = _parse(mkt.get("clobTokenIds"))
-        if not outcomes or not tokens:
-            return None
+        # Find the moneyline market matching our condition_id
+        for mkt in event.get("markets") or []:
+            if mkt.get("conditionId") != condition_id:
+                continue
 
-        # Use Gamma outcomePrices first (no extra API call)
-        gamma_prices = _parse(mkt.get("outcomePrices"))
-        if gamma_prices and len(gamma_prices) == len(outcomes):
+            outcomes = _parse(mkt.get("outcomes"))
+            gamma_prices = _parse(mkt.get("outcomePrices"))
+            if not outcomes or not gamma_prices:
+                continue
+
             gp = [float(p) for p in gamma_prices]
-            # If any outcome >= threshold on Gamma, that's enough to resolve
-            if any(p >= RESOLUTION_THRESHOLD for p in gp) or mkt.get("closed"):
+            # Resolved if market is closed OR any outcome >= threshold
+            if mkt.get("closed") or any(p >= RESOLUTION_THRESHOLD for p in gp):
                 return [(name, gp[i], None) for i, name in enumerate(outcomes)]
 
-        # No clear winner from Gamma — skip CLOB call to save resources
-        # (will be re-checked next cycle)
+            return None  # found our market but it's not resolved yet
+
         return None
 
     except Exception as e:
