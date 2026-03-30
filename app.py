@@ -534,7 +534,7 @@ def _log_if_new(result: dict):
 # ---------------------------------------------------------------------------
 RESOLVE_BATCH_SIZE = 3  # check at most 3 unresolved markets per scan cycle
 
-def check_resolutions():
+def check_resolutions(send_tg: bool = False):
     """Check a batch of unresolved swing markets. Called after each monitor scan.
     Only checks RESOLVE_BATCH_SIZE markets per call to limit memory/API usage."""
     try:
@@ -585,6 +585,14 @@ def check_resolutions():
                               l_name, l_pre, l_final, fav_won)
                 logger.info("Resolved: %s → winner=%s (fav_won=%s)",
                             mkt.get("market_question", cid), w_name, fav_won)
+
+                # Send resolution notification to Telegram
+                if send_tg:
+                    try:
+                        tg_send_resolution(mkt, w_name, w_pre,
+                                           l_name, l_pre, fav_won)
+                    except Exception as e:
+                        logger.error("TG resolution send error: %s", e)
 
             time.sleep(DELAY)
 
@@ -673,20 +681,19 @@ def _monitor_loop(config: dict):
                 _last_results = scan_data
                 _last_scan_at = scan_data["scanned_at"]
 
-            # Telegram: send if enabled and there are qualified markets
-            if send_tg and qualified:
+            # Telegram: edit-in-place or new message when market set changes
+            if send_tg:
                 try:
-                    text = _format_telegram_message(qualified)
-                    send_telegram(text)
+                    tg_handle_swing_update(qualified)
                 except Exception as e:
-                    logger.error("Monitor TG send error: %s", e)
+                    logger.error("Monitor TG error: %s", e)
 
             logger.info("Monitor scan done: %d qualified, %d total, %.1fs",
                         len(qualified), len(results), elapsed)
 
             # Check a few unresolved markets for resolution (lightweight)
             if _db_available:
-                check_resolutions()
+                check_resolutions(send_tg=send_tg)
 
         except Exception as e:
             import traceback
@@ -829,48 +836,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SITE_URL = os.environ.get("SITE_URL", "https://price-swing-monitor.onrender.com/")
 
-
-def _format_telegram_message(markets: list[dict]) -> str:
-    """Format a list of swing markets into a Telegram message (HTML mode)."""
-    from html import escape as h
-    lines = ["\U0001F6A8 <b>Price Swing Alert</b>", ""]
-
-    for r in markets:
-        sport = h(r.get("sport", ""))
-        question = h(r.get("market_question", r.get("event_title", "")))
-        url = r.get("polymarket_url", "")
-        vol = r.get("volume", 0)
-        live_m = r.get("live_minutes")
-        live_str = ""
-        if live_m is not None:
-            if live_m < 60:
-                live_str = f" | Live {live_m}m"
-            else:
-                live_str = f" | Live {live_m // 60}h {live_m % 60}m"
-
-        vol_str = _tg_fmt_num(vol)
-        lines.append(f"<b>{sport}</b> | Vol ${vol_str}{live_str}")
-        if url:
-            lines.append(f'<a href="{url}">{question}</a>')
-        else:
-            lines.append(question)
-
-        for o in r.get("outcomes", []):
-            name = h(o.get("name", "?"))
-            pre = o.get("pre_match_price")
-            cur = o.get("current_price")
-            change = o.get("change_cents")
-            pre_s = f"{pre*100:.1f}" if pre is not None else "-"
-            cur_s = f"{cur*100:.1f}" if cur is not None else "-"
-            chg_s = ""
-            if change is not None:
-                sign = "+" if change > 0 else ""
-                chg_s = f" ({sign}{change:.1f}c)"
-            lines.append(f"  {name}: {pre_s}c \u2192 {cur_s}c{chg_s}")
-        lines.append("")
-
-    lines.append(f'<a href="{SITE_URL}">Open Monitor</a>')
-    return "\n".join(lines)
+# Tracked message state for edit-in-place
+_tg_swing_msg_id: int | None = None     # message_id of the current swing alert
+_tg_swing_market_ids: set[str] = set()  # condition_ids in the current message
 
 
 def _tg_fmt_num(n) -> str:
@@ -883,8 +851,104 @@ def _tg_fmt_num(n) -> str:
     return str(round(n))
 
 
-def send_telegram(text: str) -> dict:
-    """Send a message via Telegram Bot API. Returns the API response."""
+def _find_fav_idx(outcomes: list[dict]) -> int:
+    """Find the index of the pre-match favourite (highest pre_match_price)."""
+    best_idx, best_pre = -1, -1
+    for i, o in enumerate(outcomes):
+        pre = o.get("pre_match_price")
+        if pre is not None and pre > best_pre:
+            best_pre = pre
+            best_idx = i
+    return best_idx
+
+
+def _format_telegram_message(markets: list[dict]) -> str:
+    """Format swing markets for Telegram (HTML mode)."""
+    from html import escape as h
+    n = len(markets)
+    lines = [f"\U0001F6A8 <b>Price Swing Alert</b> \u2014 {n} market{'s' if n != 1 else ''}", ""]
+
+    for r in markets:
+        sport = h(r.get("sport", ""))
+        question = h(r.get("market_question", r.get("event_title", "")))
+        url = r.get("polymarket_url", "")
+        vol = r.get("volume", 0)
+        live_m = r.get("live_minutes")
+        live_str = ""
+        if live_m is not None:
+            if live_m < 60:
+                live_str = f" | \u23f1 {live_m}m"
+            else:
+                live_str = f" | \u23f1 {live_m // 60}h{live_m % 60}m"
+
+        lines.append(f"<b>{sport}</b> | Vol ${_tg_fmt_num(vol)}{live_str}")
+        if url:
+            lines.append(f'<a href="{url}">{question}</a>')
+        else:
+            lines.append(question)
+
+        outcomes = r.get("outcomes", [])
+        fav_idx = _find_fav_idx(outcomes)
+
+        for i, o in enumerate(outcomes):
+            name = h(o.get("name", "?"))
+            pre = o.get("pre_match_price")
+            cur = o.get("current_price")
+            change = o.get("change_cents")
+            shares = o.get("shares_available")
+
+            fav_mark = "\u2B50 " if i == fav_idx else "  "
+            pre_s = f"{pre*100:.0f}" if pre is not None else "-"
+            cur_s = f"{cur*100:.0f}" if cur is not None else "-"
+            chg_s = ""
+            if change is not None:
+                sign = "+" if change > 0 else ""
+                chg_s = f" ({sign}{change:.0f}c)"
+            shares_s = f" [{_tg_fmt_num(shares)} sh]" if shares else ""
+            lines.append(f"{fav_mark}{name}: {pre_s}\u00a2 \u2192 {cur_s}\u00a2{chg_s}{shares_s}")
+        lines.append("")
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines.append(f'\U0001F552 {ts} | <a href="{SITE_URL}">Open Monitor</a>')
+    return "\n".join(lines)
+
+
+def _format_resolution_message(mkt: dict, winner_name: str, winner_pre: float,
+                                loser_name: str, loser_pre: float,
+                                fav_won: bool) -> str:
+    """Format a resolved market notification."""
+    from html import escape as h
+    question = h(mkt.get("market_question", ""))
+    sport = h(mkt.get("sport", ""))
+
+    # Determine who was the fav
+    fav_emoji = "\u2B50"
+    if fav_won:
+        verdict = "\u2705 Favourite won"
+        w_label = f"{fav_emoji} {h(winner_name)}"
+        l_label = f"  {h(loser_name)}"
+    else:
+        verdict = "\u274C Favourite lost (upset!)"
+        w_label = f"  {h(winner_name)}"
+        l_label = f"{fav_emoji} {h(loser_name)}"
+
+    w_pre_s = f"{winner_pre*100:.0f}" if winner_pre is not None else "?"
+    l_pre_s = f"{loser_pre*100:.0f}" if loser_pre is not None else "?"
+
+    lines = [
+        f"\U0001F3C1 <b>Match Resolved</b> | {sport}",
+        f"<b>{question}</b>",
+        "",
+        f"\U0001F3C6 Winner: {w_label} (was {w_pre_s}\u00a2 pre-match)",
+        f"\U0001F4A4 Loser: {l_label} (was {l_pre_s}\u00a2 pre-match)",
+        "",
+        verdict,
+    ]
+    return "\n".join(lines)
+
+
+def tg_send(text: str) -> dict:
+    """Send a new Telegram message. Returns the API response."""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -902,6 +966,63 @@ def send_telegram(text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def tg_edit(message_id: int, text: str) -> dict:
+    """Edit an existing Telegram message in-place."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        logger.error("Telegram edit error: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def tg_handle_swing_update(qualified: list[dict]):
+    """Smart Telegram updates: new message when market set changes, edit otherwise."""
+    global _tg_swing_msg_id, _tg_swing_market_ids
+
+    if not qualified:
+        # No swing markets — clear tracking (keep old message in chat)
+        _tg_swing_msg_id = None
+        _tg_swing_market_ids = set()
+        return
+
+    current_ids = {r.get("condition_id", "") for r in qualified}
+    text = _format_telegram_message(qualified)
+
+    if _tg_swing_msg_id and current_ids == _tg_swing_market_ids:
+        # Same set of markets — just edit prices in place
+        result = tg_edit(_tg_swing_msg_id, text)
+        if not result.get("ok"):
+            # Edit failed (message too old, deleted, etc.) — send new
+            result = tg_send(text)
+            if result.get("ok"):
+                _tg_swing_msg_id = result["result"]["message_id"]
+    else:
+        # Market set changed — send a new message, keep old one in chat
+        result = tg_send(text)
+        if result.get("ok"):
+            _tg_swing_msg_id = result["result"]["message_id"]
+            _tg_swing_market_ids = current_ids
+
+
+def tg_send_resolution(mkt: dict, winner_name: str, winner_pre: float,
+                       loser_name: str, loser_pre: float, fav_won: bool):
+    """Send a resolution notification (always a new message)."""
+    text = _format_resolution_message(mkt, winner_name, winner_pre,
+                                       loser_name, loser_pre, fav_won)
+    tg_send(text)
+
+
 @app.route("/api/telegram-send", methods=["POST"])
 def api_telegram_send():
     """Send swing markets to Telegram. Expects JSON body with {markets: [...]}."""
@@ -911,7 +1032,7 @@ def api_telegram_send():
         return jsonify({"ok": False, "error": "No markets provided"}), 400
 
     text = _format_telegram_message(markets)
-    result = send_telegram(text)
+    result = tg_send(text)
     return jsonify(result)
 
 
@@ -926,8 +1047,10 @@ def api_telegram_test():
             "volume": 85000,
             "live_minutes": 47,
             "outcomes": [
-                {"name": "Team Alpha", "pre_match_price": 0.72, "current_price": 0.35, "change_cents": -37.0},
-                {"name": "Team Beta", "pre_match_price": 0.28, "current_price": 0.65, "change_cents": 37.0},
+                {"name": "Team Alpha", "pre_match_price": 0.72, "current_price": 0.35,
+                 "change_cents": -37.0, "shares_available": 4250},
+                {"name": "Team Beta", "pre_match_price": 0.28, "current_price": 0.65,
+                 "change_cents": 37.0, "shares_available": 1800},
             ],
         },
         {
@@ -937,13 +1060,15 @@ def api_telegram_test():
             "volume": 250000,
             "live_minutes": 92,
             "outcomes": [
-                {"name": "Lakers", "pre_match_price": 0.68, "current_price": 0.30, "change_cents": -38.0},
-                {"name": "Celtics", "pre_match_price": 0.32, "current_price": 0.70, "change_cents": 38.0},
+                {"name": "Lakers", "pre_match_price": 0.68, "current_price": 0.30,
+                 "change_cents": -38.0, "shares_available": 12500},
+                {"name": "Celtics", "pre_match_price": 0.32, "current_price": 0.70,
+                 "change_cents": 38.0, "shares_available": 8300},
             ],
         },
     ]
     text = _format_telegram_message(fake_markets)
-    result = send_telegram(text)
+    result = tg_send(text)
     return jsonify(result)
 
 
