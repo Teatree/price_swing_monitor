@@ -274,8 +274,8 @@
       <input type="number" id="startPrice" value="68" min="1" max="99" step="1">
     </div>
     <div class="field">
-      <label>Fav Now (&lt;)</label>
-      <input type="number" id="curPrice" value="40" min="1" max="99" step="1">
+      <label>Swing Size (&ge;)</label>
+      <input type="number" id="swingMin" value="20" min="1" max="99" step="1">
     </div>
   </div>
 
@@ -422,7 +422,7 @@ function getParams() {
     min_volume:        $('minVolume').value,
     min_shares:        $('minShares').value,
     start_price_min:   $('startPrice').value,
-    current_price_max: $('curPrice').value,
+    swing_min:         $('swingMin').value,
   };
 }
 
@@ -622,7 +622,7 @@ async function startMonitor() {
         min_volume:        params.min_volume,
         min_shares:        params.min_shares,
         start_price_min:   params.start_price_min,
-        current_price_max: params.current_price_max,
+        swing_min:         params.swing_min,
         interval:          $('interval').value,
         telegram:          telegramEnabled,
       }),
@@ -713,7 +713,7 @@ async function syncState() {
         $('minShares').value = data.config.min_shares || 0;
         $('interval').value = data.config.interval || 60;
         $('startPrice').value = Math.round((data.config.start_price_min || 0.68) * 100);
-        $('curPrice').value = Math.round((data.config.current_price_max || 0.40) * 100);
+        $('swingMin').value = Math.round((data.config.swing_min || 0.20) * 100);
         // Restore sport checkboxes
         if (data.config.sports) {
           const active = new Set(data.config.sports);

@@ -307,7 +307,7 @@ def scan_markets(
     min_volume: float = 10_000,
     min_shares: float = 0,
     start_price_min: float = 0.68,
-    current_price_max: float = 0.40,
+    swing_min: float = 0.20,
 ) -> list[dict]:
     """Find live moneyline markets using breakout-from-stability detection."""
     now = datetime.now(timezone.utc)
@@ -335,7 +335,7 @@ def scan_markets(
                 seen_cids.add(cid)
                 r = _process_market(market, event, sport, now, now_unix,
                                     min_volume, min_shares,
-                                    start_price_min, current_price_max)
+                                    start_price_min, swing_min)
                 if r:
                     live_count += 1
                     results.append(r)
@@ -345,7 +345,7 @@ def scan_markets(
 
 
 def _process_market(market, event, sport, now, now_unix,
-                    min_volume, min_shares, start_min, cur_max):
+                    min_volume, min_shares, start_min, swing_min):
     """Return a result dict for live moneyline markets.
     Uses breakout-from-stability to detect if match is in progress."""
 
@@ -461,9 +461,11 @@ def _process_market(market, event, sport, now, now_unix,
         elif fav_cur is None:
             qualified = False
             disqualify_reason = "Current price unavailable"
-        elif fav_cur >= cur_max:
-            qualified = False
-            disqualify_reason = f"Fav now {fav_cur*100:.0f}\u00a2 \u2265 {cur_max*100:.0f}\u00a2 threshold"
+        else:
+            fav_drop = max_pre - fav_cur  # how much the fav has fallen
+            if fav_drop < swing_min:
+                qualified = False
+                disqualify_reason = f"Fav drop {fav_drop*100:.0f}\u00a2 < {swing_min*100:.0f}\u00a2 swing threshold"
 
     # Depth filter (depth already fetched from book)
     if qualified and min_shares > 0:
@@ -637,7 +639,7 @@ def _monitor_loop(config: dict):
     min_volume = config.get("min_volume", 10000)
     min_shares = config.get("min_shares", 0)
     start_price_min = config.get("start_price_min", 0.68)
-    current_price_max = config.get("current_price_max", 0.40)
+    swing_min = config.get("swing_min", 0.40)
     interval = max(15, config.get("interval", 60))
     send_tg = config.get("telegram", False)
 
@@ -647,7 +649,7 @@ def _monitor_loop(config: dict):
         try:
             t0 = time.time()
             results = scan_markets(sports, min_volume, min_shares,
-                                   start_price_min, current_price_max)
+                                   start_price_min, swing_min)
             elapsed = round(time.time() - t0, 1)
 
             qualified = [r for r in results if r.get("qualified")]
@@ -715,11 +717,11 @@ def api_scan():
     min_volume      = float(req.args.get("min_volume", 10000))
     min_shares      = float(req.args.get("min_shares", 0))
     start_price_min = float(req.args.get("start_price_min", 68)) / 100
-    current_price_max = float(req.args.get("current_price_max", 40)) / 100
+    swing_min = float(req.args.get("swing_min", 20)) / 100
 
     t0 = time.time()
     results = scan_markets(sports, min_volume, min_shares,
-                           start_price_min, current_price_max)
+                           start_price_min, swing_min)
     elapsed = round(time.time() - t0, 1)
 
     qualified = [r for r in results if r.get("qualified")]
@@ -755,7 +757,7 @@ def api_monitor_start():
         "min_volume": float(data.get("min_volume", 10000)),
         "min_shares": float(data.get("min_shares", 0)),
         "start_price_min": float(data.get("start_price_min", 68)) / 100,
-        "current_price_max": float(data.get("current_price_max", 40)) / 100,
+        "swing_min": float(data.get("swing_min", 20)) / 100,
         "interval": int(data.get("interval", 60)),
         "telegram": bool(data.get("telegram", False)),
     }
