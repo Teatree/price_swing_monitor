@@ -47,8 +47,8 @@ CLOB = "https://clob.polymarket.com"
 DELAY = 0.15
 
 # Live detection parameters
-STABLE_BAND_CENTS = 2      # max ±2c variation to count as "stable"
-STABLE_MIN_POINTS = 6      # minimum 6 data points (~30 min at 5-min fidelity)
+STABLE_BAND_CENTS = 3      # max ±3c variation to count as "stable"
+STABLE_MIN_POINTS = 4      # minimum 4 data points (~20 min at 5-min fidelity)
 BREAKOUT_CENTS = 5          # current price must be >=5c away from stable price
 RESOLUTION_CHECK_INTERVAL = 120  # check unresolved markets every 2 minutes
 RESOLUTION_THRESHOLD = 0.95      # outcome price >= this = winner
@@ -226,35 +226,48 @@ def clob_price_history(token_id: str, now_unix: int) -> list[dict]:
 
 
 def find_stable_price_and_breakout(history: list[dict]) -> tuple[float | None, int | None]:
-    """Walk backwards through price history to find the last stable plateau.
+    """Walk backwards through price history to find the pre-match stable plateau.
 
-    A plateau is STABLE_MIN_POINTS (6) consecutive prices where
-    max - min <= STABLE_BAND_CENTS/100.
+    A plateau is STABLE_MIN_POINTS consecutive prices within ±STABLE_BAND_CENTS.
 
-    Returns (stable_price, breakout_timestamp):
-    - stable_price: median of the plateau (pre-match line)
-    - breakout_timestamp: unix timestamp of the first point AFTER the plateau
-      (i.e., when the match started / prices began moving)
+    Key insight: during a match, prices can settle into a NEW plateau (e.g. one
+    team leads for 30 min). We skip those by checking that the current price has
+    actually broken out from the plateau. If not, we keep scanning backwards
+    until we find the real pre-match line.
+
+    Returns (stable_price, breakout_timestamp).
     """
     if len(history) < STABLE_MIN_POINTS:
         return None, None
 
     prices = [pt["p"] for pt in history]
+    current = prices[-1]
     band = STABLE_BAND_CENTS / 100
+    breakout_threshold = BREAKOUT_CENTS / 100
 
-    for end in range(len(prices) - 1, STABLE_MIN_POINTS - 2, -1):
+    end = len(prices) - 1
+    while end >= STABLE_MIN_POINTS - 1:
         start = end - STABLE_MIN_POINTS + 1
         window = prices[start:end + 1]
         if max(window) - min(window) <= band:
-            # Extend plateau backwards
+            # Found a stable region — extend it backwards
             while start > 0 and max(prices[start - 1:end + 1]) - min(prices[start - 1:end + 1]) <= band:
                 start -= 1
             plateau = prices[start:end + 1]
             stable_price = round(median(plateau), 4)
-            # Breakout = first point after the plateau
-            breakout_idx = end + 1
-            breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
-            return stable_price, breakout_ts
+
+            # Check: has the current price actually broken out from this plateau?
+            if abs(current - stable_price) >= breakout_threshold:
+                breakout_idx = end + 1
+                breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
+                return stable_price, breakout_ts
+
+            # Current price is still near this plateau — it's an in-match
+            # settling, not the pre-match line. Skip past it and keep looking.
+            end = start - 1
+            continue
+
+        end -= 1
 
     return None, None
 
@@ -265,15 +278,13 @@ def detect_live(history: list[dict], current_price: float):
     Returns (is_live, stable_price, breakout_ts).
     - stable_price is the pre-match line (median of last stable plateau)
     - breakout_ts is the unix timestamp when prices started moving
-    - is_live is True if current price has broken out >=5c from stable
+    - is_live is True if a pre-match plateau was found that the price broke out from
     """
     stable, breakout_ts = find_stable_price_and_breakout(history)
     if stable is None:
         return False, None, None
-
-    movement = abs(current_price - stable)
-    is_live = movement >= (BREAKOUT_CENTS / 100)
-    return is_live, stable, breakout_ts
+    # If we got here, the plateau was already validated for breakout
+    return True, stable, breakout_ts
 
 # ---------------------------------------------------------------------------
 # Moneyline detection
