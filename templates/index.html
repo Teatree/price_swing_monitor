@@ -216,6 +216,30 @@
   .log-table tr:last-child td { border-bottom: none; }
   .log-table tr:hover td { background: rgba(249, 115, 22, 0.04); }
 
+  /* ── Tooltips ── */
+  .hint {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%;
+    background: var(--border-hi); color: var(--muted);
+    font-size: 0.6rem; font-weight: 700; cursor: help;
+    position: relative; margin-right: 4px; vertical-align: middle;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .hint.swing-hint { background: rgba(249, 115, 22, 0.3); color: var(--accent); }
+  .hint::after {
+    content: attr(data-tip);
+    position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%);
+    background: #2a2a2e; color: var(--text); border: 1px solid var(--border-hi);
+    border-radius: 6px; padding: 8px 10px; font-size: 0.72rem;
+    font-weight: 400; line-height: 1.4;
+    width: max-content; max-width: 240px;
+    white-space: normal; text-transform: none; letter-spacing: 0;
+    pointer-events: none; opacity: 0; transition: opacity 0.15s;
+    z-index: 50; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .hint:hover::after { opacity: 1; }
+
   .hidden { display: none; }
 
   .loading-bar {
@@ -258,23 +282,23 @@
 <div class="controls">
   <div class="controls-grid">
     <div class="field">
-      <label>Market Cap ($)</label>
+      <label><span class="hint" data-tip="Minimum trading volume to show a market. Applies to all live markets.">&#63;</span> Market Cap ($)</label>
       <input type="number" id="minVolume" value="10000" min="0" step="1000">
     </div>
     <div class="field">
-      <label>Min Shares</label>
+      <label><span class="hint" data-tip="Minimum shares available at the best ask price. Applies to all live markets.">&#63;</span> Min Shares</label>
       <input type="number" id="minShares" value="0" min="0" step="50">
     </div>
     <div class="field">
-      <label>Update Interval (s)</label>
+      <label><span class="hint" data-tip="Seconds between scan cycles. Lower = more up-to-date but more API calls.">&#63;</span> Update Interval (s)</label>
       <input type="number" id="interval" value="60" min="15" step="5">
     </div>
     <div class="field">
-      <label>Pre-Match Fav (&gt;)</label>
+      <label><span class="hint swing-hint" data-tip="SWING filter: the pre-match favourite must have been priced above this value. Markets below this are shown grayed out.">&#63;</span> Pre-Match Fav (&gt;)</label>
       <input type="number" id="startPrice" value="68" min="1" max="99" step="1">
     </div>
     <div class="field">
-      <label>Swing Size (&ge;)</label>
+      <label><span class="hint swing-hint" data-tip="SWING filter: the favourite's price must have dropped by at least this many cents since pre-match. Markets with a smaller drop are shown grayed out.">&#63;</span> Swing Size (&ge;)</label>
       <input type="number" id="swingMin" value="20" min="1" max="99" step="1">
     </div>
   </div>

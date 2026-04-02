@@ -84,6 +84,14 @@ SPORT_CONFIG = {
         10359,  # Brasileirao
         10361,  # Saudi Pro League
         10444,  # K-League
+        10230,  # EFL Championship
+        10285,  # Argentina Primera
+        10287,  # Italian Cup
+        10317,  # DFB Pokal
+        10360,  # J-League
+        10438,  # A-League
+    ], "tags": [
+        102866, # La Liga 2
     ]},
     "NFL":      {"series": [10187]},
     "NBA":      {"series": [10345]},
@@ -131,14 +139,13 @@ def _parse_dt(s: str | None) -> datetime | None:
 # Gamma API
 # ---------------------------------------------------------------------------
 
-def fetch_active_events(series_id: int, limit: int = 100,
-                        max_events: int = 500) -> list[dict]:
-    """Fetch active non-closed events for a series."""
+def fetch_active_events(series_id: int = None, tag_id: int = None,
+                        limit: int = 100, max_events: int = 500) -> list[dict]:
+    """Fetch active non-closed events by series_id or tag_id."""
     out = []
     offset = 0
     while offset < max_events:
         params = {
-            "series_id": str(series_id),
             "active": "true",
             "closed": "false",
             "order": "startDate",
@@ -146,6 +153,10 @@ def fetch_active_events(series_id: int, limit: int = 100,
             "limit": limit,
             "offset": offset,
         }
+        if series_id:
+            params["series_id"] = str(series_id)
+        if tag_id:
+            params["tag_id"] = str(tag_id)
         try:
             r = requests.get(f"{GAMMA}/events", params=params, timeout=15)
             r.raise_for_status()
@@ -302,12 +313,30 @@ EXCLUDE_KW = [
 
 
 def _is_moneyline(question: str, outcomes: list) -> bool:
+    """Detect moneyline for esports/NBA/NFL/NHL (team names as outcomes)."""
     if set(outcomes) == {"Yes", "No"}:
         return False
     q = question.lower()
     if any(kw in q for kw in EXCLUDE_KW):
         return False
     return "vs" in q or "match winner" in q
+
+
+def _is_soccer_moneyline(market: dict) -> str | None:
+    """Detect soccer-style moneyline (Yes/No per outcome).
+    Returns 'team_win', 'draw', or None."""
+    outcomes = _parse(market.get("outcomes"))
+    if set(outcomes) != {"Yes", "No"}:
+        return None
+    smt = (market.get("sportsMarketType") or "").lower()
+    if smt != "moneyline":
+        return None
+    q = (market.get("question") or "").lower()
+    if "draw" in q:
+        return "draw"
+    if "win" in q:
+        return "team_win"
+    return None
 
 # ---------------------------------------------------------------------------
 # Core scan
@@ -333,11 +362,33 @@ def scan_markets(
         for sid in cfg.get("series", []):
             evts = fetch_active_events(series_id=sid)
             all_events.extend(evts)
-        logger.info("  %s → %d series, %d active events", sport, len(cfg.get("series", [])), len(all_events))
+        for tid in cfg.get("tags", []):
+            evts = fetch_active_events(tag_id=tid)
+            all_events.extend(evts)
+        n_src = len(cfg.get("series", [])) + len(cfg.get("tags", []))
+        logger.info("  %s → %d sources, %d active events", sport, n_src, len(all_events))
 
         mkt_count = 0
         live_count = 0
+        seen_event_slugs: set[str] = set()
         for event in all_events:
+            event_slug = event.get("slug", "")
+
+            # --- Soccer: group 3 Yes/No markets per match ---
+            if sport == "Soccer":
+                if event_slug in seen_event_slugs:
+                    continue
+                seen_event_slugs.add(event_slug)
+                mkt_count += 1
+                r = _process_soccer_event(event, sport, now, now_unix,
+                                          min_volume, min_shares,
+                                          start_price_min, swing_min)
+                if r:
+                    live_count += 1
+                    results.append(r)
+                continue
+
+            # --- Esports / NBA / NFL / NHL: single market per match ---
             for market in event.get("markets") or []:
                 mkt_count += 1
                 cid = market.get("conditionId", "")
@@ -506,6 +557,175 @@ def _process_market(market, event, sport, now, now_unix,
     if qualified:
         _log_if_new(result)
     return result
+
+
+def _process_soccer_event(event, sport, now, now_unix,
+                          min_volume, min_shares, start_min, swing_min):
+    """Process a soccer event with 3 separate Yes/No moneyline markets.
+    Groups them into a single result with 2 or 3 outcomes (Team A, Team B, Draw)."""
+    markets = event.get("markets") or []
+    title = event.get("title", "")
+    event_slug = event.get("slug", "")
+
+    # Find the team-win and draw markets
+    team_markets = []  # (team_name, market_dict)
+    draw_market = None
+    total_vol = 0
+
+    for m in markets:
+        if m.get("closed"):
+            continue
+        mtype = _is_soccer_moneyline(m)
+        if not mtype:
+            continue
+        try:
+            vol = float(m.get("volumeNum") or 0)
+        except (TypeError, ValueError):
+            vol = 0
+        total_vol += vol
+
+        q = m.get("question", "")
+        if mtype == "draw":
+            draw_market = m
+        elif mtype == "team_win":
+            # Extract team name from "Will TEAM win on DATE?"
+            name = q.replace("Will ", "").split(" win ")[0].strip()
+            if not name:
+                name = q
+            team_markets.append((name, m))
+
+    if len(team_markets) < 2:
+        return None
+    if total_vol < min_volume:
+        return None
+
+    # Build outcome list: each team-win market's Yes token = that team's price
+    # Draw market's Yes token = draw probability
+    outcome_entries = []  # (name, token_id, market_for_resolution)
+    for team_name, mkt in team_markets:
+        tokens = _parse(mkt.get("clobTokenIds"))
+        if not tokens:
+            continue
+        # tokens[0] = Yes token (team wins)
+        outcome_entries.append((team_name, tokens[0], mkt))
+    if draw_market:
+        dtokens = _parse(draw_market.get("clobTokenIds"))
+        if dtokens:
+            outcome_entries.append(("Draw", dtokens[0], draw_market))
+
+    if len(outcome_entries) < 2:
+        return None
+
+    # Use the highest-volume team market for live detection
+    main_token = outcome_entries[0][1]
+
+    # --- Fetch price history for live detection ---
+    history = clob_price_history(main_token, now_unix)
+    time.sleep(DELAY)
+    if not history:
+        return None
+
+    cur0 = float(history[-1]["p"])
+    is_live, stable_price, breakout_ts = detect_live(history, cur0)
+    if not is_live:
+        return None
+
+    # --- Fetch current prices from order book ---
+    current_prices = []
+    depths = []
+    for _, tok, _ in outcome_entries:
+        price, depth = clob_best_ask(tok)
+        current_prices.append(price)
+        depths.append(depth)
+        time.sleep(DELAY)
+
+    # Skip if any outcome >= 99c
+    if any(c is not None and c >= 0.99 for c in current_prices):
+        return None
+
+    # --- Pre-match prices ---
+    pre_match_prices = []
+    if stable_price is not None:
+        pre_match_prices.append(stable_price)
+        # Fetch history for other outcomes
+        for _, tok, _ in outcome_entries[1:]:
+            h = clob_price_history(tok, now_unix)
+            time.sleep(DELAY)
+            s, _ = find_stable_price_and_breakout(h)
+            pre_match_prices.append(s)
+    else:
+        pre_match_prices = [None] * len(outcome_entries)
+
+    live_minutes = int((now_unix - breakout_ts) / 60) if breakout_ts else None
+
+    # --- Build outcome data ---
+    outcome_data = []
+    for i, (name, tok, _) in enumerate(outcome_entries):
+        cur = current_prices[i] if i < len(current_prices) else None
+        pre = pre_match_prices[i] if i < len(pre_match_prices) else None
+        change = round((cur - pre) * 100, 1) if pre is not None and cur is not None else None
+        outcome_data.append({
+            "name": name,
+            "token_id": tok,
+            "current_price": cur,
+            "pre_match_price": pre,
+            "change_cents": change,
+            "shares_available": depths[i] if i < len(depths) else 0,
+        })
+
+    # --- Soft filters ---
+    qualified = True
+    disqualify_reason = None
+
+    pre_vals = [o["pre_match_price"] for o in outcome_data if o["pre_match_price"] is not None]
+    if not pre_vals:
+        qualified = False
+        disqualify_reason = "No pre-match price available"
+    else:
+        max_pre = max(pre_vals)
+        fav_idx = next(i for i, o in enumerate(outcome_data) if o["pre_match_price"] == max_pre)
+        fav_cur = outcome_data[fav_idx]["current_price"]
+
+        if max_pre < start_min:
+            qualified = False
+            disqualify_reason = f"Pre-match fav {max_pre*100:.0f}\u00a2 < {start_min*100:.0f}\u00a2 threshold"
+        elif fav_cur is None:
+            qualified = False
+            disqualify_reason = "Current price unavailable"
+        else:
+            fav_drop = max_pre - fav_cur
+            if fav_drop < swing_min:
+                qualified = False
+                disqualify_reason = f"Fav drop {fav_drop*100:.0f}\u00a2 < {swing_min*100:.0f}\u00a2 swing threshold"
+
+    if qualified and min_shares > 0:
+        for o in outcome_data:
+            if o["shares_available"] < min_shares:
+                qualified = False
+                disqualify_reason = f"Insufficient depth ({o['shares_available']:.0f} < {min_shares:.0f} shares)"
+                break
+
+    # Use first team market's condition_id for tracking
+    condition_id = outcome_entries[0][2].get("conditionId", "")
+
+    result = {
+        "event_title": title,
+        "market_question": title,
+        "condition_id": condition_id,
+        "sport": sport,
+        "game_start": None,
+        "live_minutes": live_minutes,
+        "polymarket_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
+        "volume": total_vol,
+        "outcomes": outcome_data,
+        "qualified": qualified,
+        "disqualify_reason": disqualify_reason,
+    }
+
+    if qualified:
+        _log_if_new(result)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -718,6 +938,12 @@ def _monitor_loop(config: dict):
         except Exception as e:
             import traceback
             logger.error("Monitor scan error: %s\n%s", e, traceback.format_exc())
+
+        # Self-ping to prevent Render free tier from spinning down
+        try:
+            requests.get(f"{SITE_URL}api/monitor/status", timeout=5)
+        except Exception:
+            pass
 
         # Sleep in small increments so we can stop quickly
         for _ in range(interval):
