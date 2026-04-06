@@ -236,17 +236,39 @@ def clob_price_history(token_id: str, now_unix: int) -> list[dict]:
         return []
 
 
+def _find_all_plateaus(prices: list[float], band: float, min_points: int):
+    """Scan forward through prices and collect all non-overlapping plateaus.
+    Returns list of (start_idx, end_idx, median_price, length)."""
+    plateaus = []
+    i = 0
+    while i <= len(prices) - min_points:
+        window = prices[i:i + min_points]
+        if max(window) - min(window) <= band:
+            # Found start of a plateau — extend it forward
+            end = i + min_points - 1
+            while end + 1 < len(prices) and max(prices[i:end + 2]) - min(prices[i:end + 2]) <= band:
+                end += 1
+            plateau = prices[i:end + 1]
+            plateaus.append((i, end, round(median(plateau), 4), len(plateau)))
+            i = end + 1  # skip past this plateau
+        else:
+            i += 1
+    return plateaus
+
+
 def find_stable_price_and_breakout(history: list[dict]) -> tuple[float | None, int | None]:
-    """Walk backwards through price history to find the pre-match stable plateau.
+    """Find the pre-match price using multi-plateau scoring.
 
-    A plateau is STABLE_MIN_POINTS consecutive prices within ±STABLE_BAND_CENTS.
+    1. Find ALL stable plateaus in the 8h price history
+    2. Filter to candidates where current price broke out >=5c
+    3. Score each candidate (length, position, post-plateau volatility)
+    4. Return the highest-scoring plateau as the pre-match line
 
-    Key insight: during a match, prices can settle into a NEW plateau (e.g. one
-    team leads for 30 min). We skip those by checking that the current price has
-    actually broken out from the plateau. If not, we keep scanning backwards
-    until we find the real pre-match line.
-
-    Returns (stable_price, breakout_timestamp).
+    Scoring:
+      +2 per point of length (longer = more likely pre-match)
+      +5 if earliest candidate (first plateau is usually pre-match)
+      +3 if followed by a sharp move >=5c within 2 data points
+      +2 if plateau is in the first half of history
     """
     if len(history) < STABLE_MIN_POINTS:
         return None, None
@@ -256,45 +278,64 @@ def find_stable_price_and_breakout(history: list[dict]) -> tuple[float | None, i
     band = STABLE_BAND_CENTS / 100
     breakout_threshold = BREAKOUT_CENTS / 100
 
-    end = len(prices) - 1
-    while end >= STABLE_MIN_POINTS - 1:
-        start = end - STABLE_MIN_POINTS + 1
-        window = prices[start:end + 1]
-        if max(window) - min(window) <= band:
-            # Found a stable region — extend it backwards
-            while start > 0 and max(prices[start - 1:end + 1]) - min(prices[start - 1:end + 1]) <= band:
-                start -= 1
-            plateau = prices[start:end + 1]
-            stable_price = round(median(plateau), 4)
+    # Step 1: find all plateaus
+    all_plateaus = _find_all_plateaus(prices, band, STABLE_MIN_POINTS)
+    if not all_plateaus:
+        return None, None
 
-            # Check: has the current price actually broken out from this plateau?
-            if abs(current - stable_price) >= breakout_threshold:
-                breakout_idx = end + 1
-                breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
-                return stable_price, breakout_ts
+    # Step 2: filter to candidates (current price broke out from plateau)
+    candidates = []
+    for start, end, med, length in all_plateaus:
+        if abs(current - med) >= breakout_threshold:
+            candidates.append((start, end, med, length))
 
-            # Current price is still near this plateau — it's an in-match
-            # settling, not the pre-match line. Skip past it and keep looking.
-            end = start - 1
-            continue
+    if not candidates:
+        return None, None
 
-        end -= 1
+    # Step 3: score each candidate
+    midpoint = len(prices) // 2
+    best_score = -1
+    best = None
 
-    return None, None
+    for idx, (start, end, med, length) in enumerate(candidates):
+        score = length * 2
+
+        # Earliest candidate bonus
+        if idx == 0:
+            score += 5
+
+        # First-half-of-history bonus
+        if start < midpoint:
+            score += 2
+
+        # Post-plateau volatility: sharp move within 2 points after plateau
+        for j in range(end + 1, min(end + 3, len(prices))):
+            if abs(prices[j] - med) >= breakout_threshold:
+                score += 3
+                break
+
+        if score > best_score or (score == best_score and best and start < best[0]):
+            best_score = score
+            best = (start, end, med, length)
+
+    if not best:
+        return None, None
+
+    # Step 4: return winner
+    stable_price = best[2]
+    breakout_idx = best[1] + 1
+    breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
+    return stable_price, breakout_ts
 
 
 def detect_live(history: list[dict], current_price: float):
-    """Determine if a market is live using the breakout-from-stability method.
+    """Determine if a market is live using multi-plateau scoring.
 
     Returns (is_live, stable_price, breakout_ts).
-    - stable_price is the pre-match line (median of last stable plateau)
-    - breakout_ts is the unix timestamp when prices started moving
-    - is_live is True if a pre-match plateau was found that the price broke out from
     """
     stable, breakout_ts = find_stable_price_and_breakout(history)
     if stable is None:
         return False, None, None
-    # If we got here, the plateau was already validated for breakout
     return True, stable, breakout_ts
 
 # ---------------------------------------------------------------------------
