@@ -72,6 +72,7 @@ SPORT_CONFIG = {
         10203,  # Serie A
         10204,  # UCL
         10209,  # UEL
+        10437,  # UECL (Europa Conference League)
         10189,  # MLS
         10238,  # FIFA Friendlies
         10243,  # UEFA Qualifiers
