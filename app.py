@@ -178,11 +178,14 @@ def fetch_active_events(series_id: int = None, tag_id: int = None,
 # CLOB API helpers
 # ---------------------------------------------------------------------------
 
+DEPTH_BAND_CENTS = 3  # aggregate shares within ±3c of best ask for depth
+
 def clob_best_ask(token_id: str) -> tuple[float | None, float]:
     """Get best ask price from the order book (most reliable price source).
 
     Returns (price, total_depth_shares).
     Filters out stale asks >= 95c (known Polymarket /book bug).
+    Depth = total shares within DEPTH_BAND_CENTS of the best ask price.
     Falls back to /price endpoint if /book fails.
     """
     try:
@@ -200,7 +203,8 @@ def clob_best_ask(token_id: str) -> tuple[float | None, float]:
         valid.sort(key=lambda x: x[0])
         if valid:
             best_price = valid[0][0]
-            total_depth = sum(s for _, s in valid[:5])
+            band = DEPTH_BAND_CENTS / 100
+            total_depth = sum(s for p, s in valid if p <= best_price + band)
             return best_price, total_depth
     except Exception as e:
         logger.debug("book error %s: %s", token_id, e)
