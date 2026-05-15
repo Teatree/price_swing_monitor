@@ -343,6 +343,30 @@ def detect_live(history: list[dict], current_price: float):
         return False, None, None
     return True, stable, breakout_ts
 
+
+def find_pre_match_price(history: list[dict]) -> tuple[float | None, int | None]:
+    """Find a pre-match line WITHOUT requiring a breakout.
+
+    Used when live status is already known (e.g. event.live=True from Gamma).
+    Picks the longest early plateau as the pre-match line. Falls back to the
+    earliest price in history if no plateau exists.
+    Returns (stable_price, breakout_ts).
+    """
+    if not history:
+        return None, None
+    prices = [pt["p"] for pt in history]
+    band = STABLE_BAND_CENTS / 100
+    plateaus = _find_all_plateaus(prices, band, STABLE_MIN_POINTS)
+    if plateaus:
+        # Prefer the longest plateau; tie-break by earliest start
+        plateaus.sort(key=lambda p: (-p[3], p[0]))
+        _, end, med, _ = plateaus[0]
+        breakout_idx = end + 1
+        breakout_ts = history[breakout_idx]["t"] if breakout_idx < len(history) else None
+        return med, breakout_ts
+    # No plateau — use earliest price as a coarse fallback
+    return round(prices[0], 4), history[0]["t"]
+
 # ---------------------------------------------------------------------------
 # Moneyline detection
 # ---------------------------------------------------------------------------
@@ -455,12 +479,22 @@ def scan_markets(
 def _process_market(market, event, sport, now, now_unix,
                     min_volume, min_shares, start_min, swing_min):
     """Return a result dict for live moneyline markets.
-    Uses breakout-from-stability to detect if match is in progress."""
+    Uses Gamma's native event.live flag when available (esports), falling back
+    to breakout-from-stability detection for events where it's None."""
 
     # --- Hard filters ---
 
     if market.get("closed"):
         return None
+
+    # Native Gamma signals (populated for esports; None for NBA/NFL/NHL/Soccer)
+    native_live = event.get("live")
+    native_ended = event.get("ended")
+    native_period = event.get("period")
+    if native_ended is True:
+        return None
+    if native_live is False:
+        return None  # known pre-match — skip
 
     try:
         vol = float(market.get("volumeNum") or 0)
@@ -486,19 +520,21 @@ def _process_market(market, event, sport, now, now_unix,
         if any(p >= 0.99 for p in gp):
             return None
 
-    # --- Fetch price history for live detection (1 CLOB call) ---
+    # --- Fetch price history (used for both detection paths) ---
     history = clob_price_history(tokens[0], now_unix)
     time.sleep(DELAY)
 
-    if not history:
-        return None
-
-    # Use the latest point from history as current price for token 0
-    cur0 = float(history[-1]["p"])
-
-    is_live, stable_price, breakout_ts = detect_live(history, cur0)
-    if not is_live:
-        return None
+    if native_live is True:
+        # Trust Gamma — find a pre-match line without requiring a breakout
+        stable_price, breakout_ts = find_pre_match_price(history)
+    else:
+        # Fall back to breakout heuristic (live flag missing)
+        if not history:
+            return None
+        cur0 = float(history[-1]["p"])
+        is_live, stable_price, breakout_ts = detect_live(history, cur0)
+        if not is_live:
+            return None
 
     # --- Now fetch real best-ask prices from order book (only for live markets) ---
     current: list[float | None] = []
@@ -593,6 +629,7 @@ def _process_market(market, event, sport, now, now_unix,
         "sport": sport,
         "game_start": market.get("gameStartTime"),
         "live_minutes": live_minutes,
+        "period": native_period,
         "polymarket_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "volume": vol,
         "outcomes": outcome_data,
@@ -612,6 +649,15 @@ def _process_soccer_event(event, sport, now, now_unix,
     markets = event.get("markets") or []
     title = event.get("title", "")
     event_slug = event.get("slug", "")
+
+    # Native Gamma signals (currently None for soccer; future-proof)
+    native_live = event.get("live")
+    native_ended = event.get("ended")
+    native_period = event.get("period")
+    if native_ended is True:
+        return None
+    if native_live is False:
+        return None
 
     # Find the team-win and draw markets
     team_markets = []  # (team_name, market_dict)
@@ -665,16 +711,20 @@ def _process_soccer_event(event, sport, now, now_unix,
     # Use the highest-volume team market for live detection
     main_token = outcome_entries[0][1]
 
-    # --- Fetch price history for live detection ---
+    # --- Fetch price history (used for both detection paths) ---
     history = clob_price_history(main_token, now_unix)
     time.sleep(DELAY)
-    if not history:
-        return None
 
-    cur0 = float(history[-1]["p"])
-    is_live, stable_price, breakout_ts = detect_live(history, cur0)
-    if not is_live:
-        return None
+    if native_live is True:
+        # Trust Gamma — find pre-match line without requiring breakout
+        stable_price, breakout_ts = find_pre_match_price(history)
+    else:
+        if not history:
+            return None
+        cur0 = float(history[-1]["p"])
+        is_live, stable_price, breakout_ts = detect_live(history, cur0)
+        if not is_live:
+            return None
 
     # --- Fetch current prices from order book ---
     current_prices = []
@@ -761,6 +811,7 @@ def _process_soccer_event(event, sport, now, now_unix,
         "sport": sport,
         "game_start": None,
         "live_minutes": live_minutes,
+        "period": native_period,
         "polymarket_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "volume": total_vol,
         "outcomes": outcome_data,
